@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 // Per-character typing cadence. Owned here because the typewriter is the source of truth
 // for typing speed; the host's prompt countdown imports it to outlast the animation.
@@ -19,13 +19,22 @@ export function Typewriter({ lines, onComplete, plain, plainClassName }: Typewri
   const total = lines.reduce((a, l) => a + l.lineText.length, 0)
   const [shown, setShown] = useState(0)
 
+  const onCompleteRef = useRef(onComplete)
+  useEffect(() => { onCompleteRef.current = onComplete }, [onComplete])
+
   useEffect(() => {
     const iv = setInterval(() => setShown((s) => {
-      if (s >= total) { clearInterval(iv); onComplete?.(); return s }
+      if (s >= total) { clearInterval(iv); return s }
       return s + 1
     }), TYPE_SPEED_MS)
     return () => clearInterval(iv)
-  }, [total, onComplete])
+  }, [total])
+
+  // Fire onComplete once when typing finishes, outside the state updater.
+  useEffect(() => {
+    if (shown >= total && total > 0) onCompleteRef.current?.()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shown >= total])
 
   if (plain) {
     const visible = Math.min(total, shown)

@@ -38,6 +38,9 @@ export default function HostPage() {
   const [reactions, setReactions] = useState<FloatingReaction[]>([])
   const [presentIds, setPresentIds] = useState<Set<string>>(new Set())
   const [presenceReady, setPresenceReady] = useState(false)
+  const [promptCountdown, setPromptCountdown] = useState<number | null>(null)
+  // Tracks which conversationId's context has finished typing, so the quote only starts after.
+  const [contextDoneForConv, setContextDoneForConv] = useState<number | null>(null)
 
   const channelRef = useRef<RealtimeChannel | null>(null)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -287,10 +290,14 @@ export default function HostPage() {
     if (!conv) { broadcast({ ...cur, phase: 'leaderboard' }); return }
     usedConvIdsRef.current = [...usedConvIdsRef.current, conv.id]
     const question = buildRoundQuestion(conv)
+    const contextChars = question.context?.length ?? 0
+    const quoteChars = question.lines.reduce((a, l) => a + l.lineText.length, 0)
+    const promptMs = Math.min(20000, Math.max(8000, (contextChars + quoteChars) * TYPE_SPEED_MS + PROMPT_BUFFER_MS))
     const nextState: GameState = {
       ...cur,
       phase: 'prompt',
       currentRound: advance ? cur.currentRound + 1 : cur.currentRound,
+      promptEnd: Date.now() + promptMs,
       question, guesses: {}, timerStart: null, revealedAnswers: {}, scores: {}, streakBonuses: {}, perfectRound: {}, bets: {}, swapTargets: {}, executedSwaps: [],
     }
     setTimeLeft(nextState.timerDuration)
@@ -298,12 +305,10 @@ export default function HostPage() {
     beginPromptCountdown()
   }
 
-  // Prompt duration scales with quote length so the typewriter finishes typing first.
+  // Fires when the pre-calculated promptEnd timestamp is reached.
   function beginPromptCountdown() {
     if (promptRef.current) clearTimeout(promptRef.current)
-    const s = stateRef.current
-    const chars = s?.question ? s.question.lines.reduce((a, l) => a + l.lineText.length, 0) : 0
-    const promptMs = Math.min(20000, Math.max(8000, chars * TYPE_SPEED_MS + PROMPT_BUFFER_MS))
+    const remaining = Math.max(0, (stateRef.current?.promptEnd ?? 0) - Date.now())
     promptRef.current = setTimeout(() => {
       const cur = stateRef.current
       if (!cur) return
@@ -311,7 +316,7 @@ export default function HostPage() {
       setTimeLeft(guessingState.timerDuration)
       broadcast(guessingState)
       startTimer(guessingState)
-    }, promptMs)
+    }, remaining)
   }
 
   function startTimer(gameState: GameState) {
@@ -374,6 +379,14 @@ export default function HostPage() {
     return () => clearInterval(iv)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state?.phase, state?.question?.conversationId])
+
+  useEffect(() => {
+    if (state?.phase !== 'prompt' || !state.promptEnd) { setPromptCountdown(null); return }
+    const tick = () => setPromptCountdown(Math.max(0, Math.ceil((state.promptEnd! - Date.now()) / 1000)))
+    tick()
+    const iv = setInterval(tick, 250)
+    return () => clearInterval(iv)
+  }, [state?.phase, state?.promptEnd])
 
   useEffect(() => () => {
     if (timerRef.current) clearInterval(timerRef.current)
@@ -519,13 +532,34 @@ export default function HostPage() {
       )}
 
       {/* Prompt Phase */}
-      {state.phase === 'prompt' && state.question && (
-        <div className="flex-1 flex flex-col items-center justify-center gap-6 animate-slide-up max-w-3xl mx-auto w-full">
-          <ContextBar context={state.question.context} happenedAt={state.question.happenedAt} />
-          <Typewriter key={state.question.conversationId} lines={state.question.lines} />
-          <p className="text-lg font-bold animate-pulse" style={{ color: 'var(--accent)' }}>Get ready to guess…</p>
-        </div>
-      )}
+      {state.phase === 'prompt' && state.question && (() => {
+        const conv = state.question
+        const hasContext = !!conv.context
+        const contextDone = !hasContext || contextDoneForConv === conv.conversationId
+        return (
+          <div className="flex-1 flex flex-col items-center justify-center gap-6 animate-slide-up max-w-3xl mx-auto w-full">
+            <ContextBar context={null} happenedAt={conv.happenedAt} />
+            {hasContext && (
+              <Typewriter
+                key={`ctx-${conv.conversationId}`}
+                plain
+                plainClassName="text-sm italic w-full"
+                lines={[{ lineId: -1, lineText: `📍 ${conv.context}`, actionText: null }]}
+                onComplete={() => setContextDoneForConv(conv.conversationId)}
+              />
+            )}
+            {contextDone && (
+              <Typewriter key={conv.conversationId} lines={conv.lines} />
+            )}
+            <div className="flex items-center gap-3">
+              <p className="text-lg font-bold animate-pulse" style={{ color: 'var(--accent)' }}>Get ready to guess…</p>
+              {promptCountdown !== null && promptCountdown > 0 && (
+                <span className="text-2xl font-black tabular-nums" style={{ color: 'var(--accent)' }}>{promptCountdown}</span>
+              )}
+            </div>
+          </div>
+        )
+      })()}
 
       {/* Guessing Phase */}
       {state.phase === 'guessing' && state.question && (
@@ -536,10 +570,9 @@ export default function HostPage() {
             {state.question.lines.map((line) => (
               <div key={line.lineId} className="rounded-2xl p-5" style={{ background: 'var(--surface)' }}>
                 {line.actionText && <p className="text-xs italic mb-1" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
-                <div className="flex gap-3 items-start">
-                  <span className="font-black" style={{ color: 'var(--primary-light)' }}>???</span>
-                  <p className="flex-1">&ldquo;{line.lineText}&rdquo;</p>
-                </div>
+                <p>&ldquo;{line.lineText}&rdquo;{' '}
+                  <span className="text-sm font-bold" style={{ color: 'var(--primary-light)' }}>— ???</span>
+                </p>
               </div>
             ))}
           </div>
@@ -566,7 +599,7 @@ export default function HostPage() {
       {state.phase === 'reveal' && state.question && (
         <div className="flex-1 flex flex-col gap-6 max-w-3xl mx-auto w-full animate-slide-up">
           <h2 className="text-3xl font-black text-center">The Answer!</h2>
-          <ContextBar context={state.question.context} happenedAt={state.question.happenedAt} small />
+          <ContextBar context={null} happenedAt={state.question.happenedAt} small />
 
           <div className="space-y-4">
             {state.question.lines.map((line, idx) => {
@@ -579,27 +612,55 @@ export default function HostPage() {
               return (
                 <div key={line.lineId} className="rounded-2xl p-5 transition-all"
                   style={{ background: 'var(--surface)', border: `2px solid ${shown ? 'var(--correct)' : 'transparent'}` }}>
-                  {line.actionText && <p className="text-xs italic mb-1" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
-                  <div className="flex gap-3 items-start">
-                    <span className="font-black min-w-[4rem]" style={{ color: shown ? 'var(--correct)' : 'var(--primary-light)' }}>
-                      {shown ? line.speakerName : '???'}
+                  {/* Context + Quote + Author inline */}
+                  {idx === 0 && state.question?.context && <p className="text-sm italic mb-2" style={{ color: 'var(--muted)' }}>📍 {state.question.context}</p>}
+                  {line.actionText && <p className="text-xs italic mb-2" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
+                  <p className="text-xl font-medium" style={{ color: 'var(--text)' }}>
+                    &ldquo;{line.lineText}&rdquo;{' '}
+                    <span className="text-base font-bold" style={{ color: shown ? '#f59e0b' : 'var(--muted)' }}>
+                      — {shown ? line.speakerName : '???'}
                     </span>
-                    <p className="flex-1">&ldquo;{line.lineText}&rdquo;</p>
-                  </div>
-                  {shown && lineGuesses.length > 0 && (
-                    <div className="flex flex-wrap gap-2 mt-3 pl-[4.75rem] animate-slide-up">
-                      {lineGuesses.map(({ player, guessId }) => {
-                        const correct = guessId === line.speakerId
-                        const guessName = state.speakers.find((s) => s.id === guessId)?.name ?? '—'
-                        return (
-                          <span key={player.id} className="rounded-full px-3 py-0.5 text-xs font-bold"
-                            style={{ background: correct ? 'var(--correct)' : 'rgba(239,68,68,0.2)', color: correct ? '#fff' : 'var(--incorrect)' }}>
-                            {player.avatar} {player.name}: {guessName} {correct ? '✓' : '✗'}
-                          </span>
-                        )
-                      })}
-                    </div>
-                  )}
+                  </p>
+
+                  {/* Guesses */}
+                  {shown && lineGuesses.length > 0 && (() => {
+                    const correctGuesses = lineGuesses.filter(({ guessId }) => guessId === line.speakerId)
+                    const incorrectGuesses = lineGuesses.filter(({ guessId }) => guessId !== line.speakerId)
+                    return (
+                      <div className="animate-slide-up" style={{ borderTop: '1px solid rgba(148,163,184,0.15)', marginTop: '0.75rem', paddingTop: '0.75rem' }}>
+                        {correctGuesses.length > 0 && (
+                          <div className="mb-2">
+                            <p className="text-[10px] uppercase tracking-widest mb-1.5 font-bold" style={{ color: 'rgba(74,222,128,0.8)' }}>Correct</p>
+                            <div className="flex flex-wrap gap-2">
+                              {correctGuesses.map(({ player }) => (
+                                <span key={player.id} className="inline-flex items-center gap-1 rounded-full px-3 py-0.5 text-xs font-bold"
+                                  style={{ background: 'var(--correct)', color: '#fff' }}>
+                                  {player.avatar} {player.name}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {incorrectGuesses.length > 0 && (
+                          <div>
+                            <p className="text-[10px] uppercase tracking-widest mb-1.5 font-bold" style={{ color: 'rgba(100,116,139,0.8)' }}>Incorrect</p>
+                            <div className="flex flex-wrap gap-2">
+                              {incorrectGuesses.map(({ player, guessId }) => {
+                                const guessName = state.speakers.find((s) => s.id === guessId)?.name ?? '—'
+                                return (
+                                  <span key={player.id} className="inline-flex items-center gap-1 rounded-full px-3 py-0.5 text-xs font-bold border"
+                                    style={{ background: 'rgba(30,41,59,0.5)', borderColor: 'rgba(51,65,85,1)' }}>
+                                    <span style={{ color: 'rgb(203,213,225)' }}>{player.avatar} {player.name}</span>
+                                    <span style={{ color: 'rgb(100,116,139)' }}> ➔ {guessName}</span>
+                                  </span>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })()}
                 </div>
               )
             })}

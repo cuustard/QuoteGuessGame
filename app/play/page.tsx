@@ -38,6 +38,7 @@ function PlayerController() {
   const [swapTarget, setSwapTargetState] = useState<string | null>(null)
   const [activeLineId, setActiveLineId] = useState<number | null>(null)
   const [error, setError] = useState('')
+  const [promptCountdown, setPromptCountdown] = useState<number | null>(null)
   const channelRef = useRef<RealtimeChannel | null>(null)
   const joinedRef = useRef(false)
   const lastPhaseRef = useRef<string | null>(null)
@@ -135,6 +136,14 @@ function PlayerController() {
     if (gameState.phase === 'prompt' && lastPhaseRef.current !== 'prompt') playTick()
     lastPhaseRef.current = gameState.phase
   }, [gameState, myGuesses])
+
+  useEffect(() => {
+    if (gameState?.phase !== 'prompt' || !gameState.promptEnd) { setPromptCountdown(null); return }
+    const tick = () => setPromptCountdown(Math.max(0, Math.ceil((gameState.promptEnd! - Date.now()) / 1000)))
+    tick()
+    const iv = setInterval(tick, 250)
+    return () => clearInterval(iv)
+  }, [gameState?.phase, gameState?.promptEnd])
 
   // Stop the pulse / pending payoff if the player navigates away mid-reveal.
   useEffect(() => () => {
@@ -330,6 +339,12 @@ function PlayerController() {
             </div>
           )}
           <p className="text-sm" style={{ color: 'var(--muted)' }}>Reading the quote… look at the host screen.</p>
+          {promptCountdown !== null && promptCountdown > 0 && (
+            <div className="flex flex-col items-center gap-1">
+              <span className="text-5xl font-black tabular-nums" style={{ color: 'var(--accent)' }}>{promptCountdown}</span>
+              <span className="text-xs uppercase tracking-widest" style={{ color: 'var(--muted)' }}>guessing starts in</span>
+            </div>
+          )}
           <div className="flex gap-2">
             <span className="w-3 h-3 rounded-full animate-bounce" style={{ background: 'var(--accent)', animationDelay: '0ms' }} />
             <span className="w-3 h-3 rounded-full animate-bounce" style={{ background: 'var(--accent)', animationDelay: '150ms' }} />

@@ -4,19 +4,39 @@ import { useEffect, useState } from 'react'
 
 // Per-character typing cadence. Owned here because the typewriter is the source of truth
 // for typing speed; the host's prompt countdown imports it to outlast the animation.
-export const TYPE_SPEED_MS = 28
+export const TYPE_SPEED_MS = 80
+
+interface TypewriterProps {
+  lines: { lineId: number; lineText: string; actionText: string | null }[]
+  onComplete?: () => void
+  // plain=true: renders bare text with no card/??? wrapper (used for context strings)
+  plain?: boolean
+  plainClassName?: string
+}
 
 // Types the quote out character-by-character. Keyed by conversationId so it remounts each round.
-export function Typewriter({ lines }: { lines: { lineId: number; lineText: string; actionText: string | null }[] }) {
+export function Typewriter({ lines, onComplete, plain, plainClassName }: TypewriterProps) {
   const total = lines.reduce((a, l) => a + l.lineText.length, 0)
   const [shown, setShown] = useState(0)
+
   useEffect(() => {
     const iv = setInterval(() => setShown((s) => {
-      if (s >= total) { clearInterval(iv); return s }
+      if (s >= total) { clearInterval(iv); onComplete?.(); return s }
       return s + 1
     }), TYPE_SPEED_MS)
     return () => clearInterval(iv)
-  }, [total])
+  }, [total, onComplete])
+
+  if (plain) {
+    const visible = Math.min(total, shown)
+    const text = lines.map((l) => l.lineText).join('')
+    const typing = shown < total
+    return (
+      <p className={plainClassName}>
+        {text.slice(0, visible)}{typing && <span className="cursor-blink">▋</span>}
+      </p>
+    )
+  }
 
   return (
     <div className="w-full space-y-4">
@@ -29,10 +49,10 @@ export function Typewriter({ lines }: { lines: { lineId: number; lineText: strin
         return (
           <div key={line.lineId} className="rounded-2xl p-6 space-y-1 animate-slide-up" style={{ background: 'var(--surface)' }}>
             {line.actionText && <p className="text-sm italic" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
-            <div className="flex gap-3 items-start">
-              <span className="font-black text-xl" style={{ color: 'var(--primary-light)' }}>???</span>
-              <p className="text-xl flex-1">&ldquo;{line.lineText.slice(0, visible)}&rdquo;{typing && <span className="cursor-blink">▋</span>}</p>
-            </div>
+            <p className="text-xl">
+              &ldquo;{line.lineText.slice(0, visible)}&rdquo;{typing && <span className="cursor-blink">▋</span>}{' '}
+              {!typing && <span className="text-base font-bold" style={{ color: 'var(--primary-light)' }}>— ???</span>}
+            </p>
           </div>
         )
       })}

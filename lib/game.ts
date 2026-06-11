@@ -251,6 +251,7 @@ export function createInitialGameState(roomCode: string, totalRounds: number, sp
     guesses: {},
     timerStart: null,
     timerDuration: TIMER_DURATION_MS,
+    promptEnd: null,
     revealedAnswers: {},
     scores: {},
     streakBonuses: {},

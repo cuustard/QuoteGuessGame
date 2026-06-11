@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "PowerShell(cd D:\\\\github\\\\QuoteGuessGame; \\(Get-Content app\\\\play\\\\page.tsx\\) -replace 'playerId\\\\.current', 'playerId' | Set-Content app\\\\play\\\\page.tsx -Encoding utf8)",
-      "PowerShell(npx tsc --noEmit -p D:\\\\github\\\\QuoteGuessGame\\\\tsconfig.json 2>&1)"
+      "PowerShell(npx tsc --noEmit -p D:\\\\github\\\\QuoteGuessGame\\\\tsconfig.json 2>&1)",
+      "Bash(npx tsc *)"
     ]
   }
 }

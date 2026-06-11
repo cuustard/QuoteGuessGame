@@ -68,6 +68,7 @@ export interface GameState {
   guesses: Record<number, Record<string, number>>
   timerStart: number | null // epoch ms
   timerDuration: number // ms — configurable by host in lobby
+  promptEnd: number | null // epoch ms when prompt phase ends and guessing begins
   // revealed: lineId -> speakerId (set during reveal phase)
   revealedAnswers: Record<number, number>
   scores: Record<string, number> // playerId -> score delta this round

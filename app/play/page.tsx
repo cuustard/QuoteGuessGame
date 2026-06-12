@@ -6,7 +6,7 @@ import { useEffect, useRef, useState, Suspense } from 'react'
 import Link from 'next/link'
 import { useSearchParams } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
-import { computeRoundDrinks, drinkResultText, ALLIN_MIN_BUYIN, SWAP_MIN_BUYIN } from '@/lib/game'
+import { computeRoundDrinks, computeRfDrink, drinkResultText, ALLIN_MIN_BUYIN, SWAP_MIN_BUYIN } from '@/lib/game'
 import { TYPE_SPEED_MS } from '@/app/host/components/Typewriter'
 import { unlockAudio, playCorrect, playWrong, playTick } from '@/lib/sounds'
 import { haptics } from '@/lib/haptics'
@@ -37,6 +37,7 @@ function PlayerController() {
   const [lockedIn, setLockedIn] = useState(false)
   const [bet, setBetState] = useState<Bet>(1)
   const [swapTarget, setSwapTargetState] = useState<string | null>(null)
+  const [rfVote, setRfVote] = useState<'real' | 'fake' | null>(null)
   const [activeLineId, setActiveLineId] = useState<number | null>(null)
   const [error, setError] = useState('')
   const [promptCountdown, setPromptCountdown] = useState<number | null>(null)
@@ -75,13 +76,13 @@ function PlayerController() {
       // wipe a bet the player already placed when, e.g., another player joins mid-prompt.
       const convId = payload.state.question?.conversationId ?? null
       if (payload.state.phase === 'lobby') {
-        setMyGuesses({}); setLockedIn(false); setBetState(1); setSwapTargetState(null); setActiveLineId(null)
+        setMyGuesses({}); setLockedIn(false); setBetState(1); setSwapTargetState(null); setActiveLineId(null); setRfVote(null)
         roundResetRef.current = null
         betSentRef.current = false
       } else if (payload.state.phase === 'prompt' && convId !== null && roundResetRef.current !== convId) {
         roundResetRef.current = convId
         betSentRef.current = false
-        setMyGuesses({}); setLockedIn(false); setBetState(1); setSwapTargetState(null); setActiveLineId(null)
+        setMyGuesses({}); setLockedIn(false); setBetState(1); setSwapTargetState(null); setActiveLineId(null); setRfVote(null)
       }
     })
 
@@ -131,7 +132,8 @@ function PlayerController() {
     }
     if (gameState.phase === 'reveal' && lastPhaseRef.current !== 'reveal') {
       const lines = gameState.question?.lines ?? []
-      const allRight = lines.length > 0 && lines.every((l) => myGuesses[l.lineId] === gameState.revealedAnswers[l.lineId])
+      // Authoritative across all modes (classic lines, RF vote, survival) — host computed it.
+      const allRight = gameState.perfectRound[playerId] === true
       // Heartbeat tension during the host's staged reveal, then the payoff buzz on unmask.
       haptics.startAnticipationPulse()
       const revealMs = Math.min(2500, Math.max(1, lines.length) * 900)
@@ -144,7 +146,7 @@ function PlayerController() {
     }
     if (gameState.phase === 'prompt' && lastPhaseRef.current !== 'prompt') playTick()
     lastPhaseRef.current = gameState.phase
-  }, [gameState, myGuesses])
+  }, [gameState, myGuesses, playerId])
 
   useEffect(() => {
     const active = gameState?.phase === 'prompt' && !!gameState.promptEnd
@@ -168,8 +170,10 @@ function PlayerController() {
     }
     const compute = () => {
       if (!q || !promptTypeRef.current) return 0
+      const claim = gameState?.rfClaim
+      const lines = gameState?.mode === 'realfake' && claim ? q.lines.filter((l) => l.lineId === claim.lineId) : q.lines
       const contextDelay = (q.context ? `📍 ${q.context}`.length : 0) * TYPE_SPEED_MS
-      const quoteLen = q.lines.reduce((a, l) => a + l.lineText.length, 0)
+      const quoteLen = lines.reduce((a, l) => a + l.lineText.length, 0)
       const elapsed = Date.now() - promptTypeRef.current.start - contextDelay
       return Math.max(0, Math.min(quoteLen, Math.floor(elapsed / TYPE_SPEED_MS)))
     }
@@ -183,7 +187,7 @@ function PlayerController() {
   // Blind Confidence: the bet is chosen during the prompt phase and transmitted the instant
   // guessing opens — before any guess can end the round — so no one is mid-bet at round end.
   useEffect(() => {
-    if (gameState?.phase !== 'guessing' || betSentRef.current) return
+    if (gameState?.phase !== 'guessing' || gameState.mode !== 'classic' || betSentRef.current) return
     betSentRef.current = true
     const ch = channelRef.current
     if (!ch) return
@@ -236,6 +240,18 @@ function PlayerController() {
     if (gameState?.phase !== 'prompt') return
     haptics.tap()
     setSwapTargetState(targetId)
+  }
+
+  // Real or Cap: voting IS the lock-in (one tap, no take-backs).
+  async function voteRf(vote: 'real' | 'fake') {
+    if (rfVote || gameState?.phase !== 'guessing' || gameState.mode !== 'realfake') return
+    haptics.lockIn()
+    setRfVote(vote)
+    await channelRef.current?.send({
+      type: 'broadcast',
+      event: 'rf_vote',
+      payload: { type: 'rf_vote', playerId, vote } satisfies ChannelMessage,
+    })
   }
 
   async function sendReaction(emoji: string) {
@@ -334,6 +350,13 @@ function PlayerController() {
   // Read-only label for the bet locked in during the prompt phase.
   const betLabel = bet === 'swap' ? '🔀 Point Swap' : bet === 3 ? '💀 All-In' : bet === 2 ? '🔥 Risky ×2' : bet === 0.5 ? '🛡 Safe ×0.5' : '😐 No bet'
 
+  // Mode-derived: RF rounds show only the claimed line; survival tracks my lives.
+  const promptLines = gameState.mode === 'realfake' && gameState.rfClaim
+    ? (gameState.question?.lines ?? []).filter((l) => l.lineId === gameState.rfClaim!.lineId)
+    : gameState.question?.lines ?? []
+  const myLives = gameState.lives[playerId] ?? 0
+  const amEliminated = gameState.mode === 'survival' && gameState.phase !== 'lobby' && myLives <= 0 && Object.keys(gameState.lives).length > 0
+
   // Guessing-phase derived values (single shared grid targets the active line)
   const gLines = gameState.question?.lines ?? []
   const gMulti = gLines.length > 1
@@ -367,11 +390,23 @@ function PlayerController() {
         <div className="flex-1 flex flex-col items-center justify-center gap-4 animate-slide-up">
           <div className="text-6xl">🎉</div>
           <h2 className="text-2xl font-black text-center">You&apos;re in!</h2>
-          {gameState.mode === 'drinking' && (
-            <div className="rounded-full px-4 py-1 text-sm font-black" style={{ background: 'var(--accent)', color: '#000' }}>
-              🍺 Tipsy Edition — wrong = drink!
-            </div>
-          )}
+          <div className="flex flex-wrap gap-2 justify-center">
+            {gameState.mode === 'realfake' && (
+              <div className="rounded-full px-4 py-1 text-sm font-black" style={{ background: 'var(--primary)', color: '#fff' }}>
+                🕵 Real or Cap — spot the fakes!
+              </div>
+            )}
+            {gameState.mode === 'survival' && (
+              <div className="rounded-full px-4 py-1 text-sm font-black" style={{ background: 'var(--incorrect)', color: '#fff' }}>
+                💀 Survival — 3 lives, last one standing
+              </div>
+            )}
+            {gameState.drinking && (
+              <div className="rounded-full px-4 py-1 text-sm font-black" style={{ background: 'var(--accent)', color: '#000' }}>
+                🍺 Tipsy Edition — wrong = drink!
+              </div>
+            )}
+          </div>
           <p className="text-center" style={{ color: 'var(--muted)' }}>
             Waiting for the host to start the game…
           </p>
@@ -406,8 +441,8 @@ function PlayerController() {
           {/* The quote, typed in sync with the host's TV typewriter so you can read + bet without looking up */}
           {gameState.question && (
             <div className="rounded-2xl p-4 space-y-2 min-h-[3.5rem]" style={{ background: 'var(--surface)' }}>
-              {gameState.question.lines.map((line, i) => {
-                const startOffset = gameState.question!.lines.slice(0, i).reduce((a, l) => a + l.lineText.length, 0)
+              {promptLines.map((line, i) => {
+                const startOffset = promptLines.slice(0, i).reduce((a, l) => a + l.lineText.length, 0)
                 if (promptTyped <= startOffset) return null
                 const visible = Math.min(line.lineText.length, promptTyped - startOffset)
                 const typing = promptTyped < startOffset + line.lineText.length
@@ -415,7 +450,9 @@ function PlayerController() {
                   <div key={line.lineId} className="animate-slide-up">
                     {line.actionText && <p className="text-xs italic mb-0.5" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
                     <p className="leading-snug">
-                      <span className="font-black" style={{ color: 'var(--primary-light)' }}>???</span>{' '}
+                      <span className="font-black" style={{ color: gameState.mode === 'realfake' ? 'var(--accent)' : 'var(--primary-light)' }}>
+                        {gameState.mode === 'realfake' && gameState.rfClaim ? gameState.rfClaim.claimedSpeakerName : '???'}
+                      </span>{' '}
                       &ldquo;{line.lineText.slice(0, visible)}&rdquo;{typing && <span className="cursor-blink">▋</span>}
                     </p>
                   </div>
@@ -425,7 +462,27 @@ function PlayerController() {
             </div>
           )}
 
-          {/* Place your bet — NO BET is the safe default; the stakes are grouped below it */}
+          {/* Real or Cap: the claim is the whole game — get ready to vote */}
+          {gameState.mode === 'realfake' && gameState.rfClaim && (
+            <div className="rounded-2xl p-3 text-center" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
+              <p className="font-black" style={{ color: 'var(--accent)' }}>
+                🕵 Did {gameState.rfClaim.claimedSpeakerName} really say this?
+              </p>
+              <p className="text-xs mt-1" style={{ color: 'var(--muted)' }}>Voting opens when the countdown ends — +500 for the right call.</p>
+            </div>
+          )}
+
+          {/* Survival: your lives */}
+          {gameState.mode === 'survival' && (
+            <div className="rounded-2xl p-3 text-center" style={{ background: 'var(--surface)', border: '2px solid var(--incorrect)' }}>
+              {amEliminated
+                ? <p className="font-black" style={{ color: 'var(--incorrect)' }}>💀 You&apos;re out — spectating</p>
+                : <p className="font-black">{'❤️'.repeat(myLives)} <span className="text-xs font-normal" style={{ color: 'var(--muted)' }}>miss a round, lose a life</span></p>}
+            </div>
+          )}
+
+          {/* Place your bet — classic mode only (RF votes / survival lives are the stakes) */}
+          {gameState.mode === 'classic' && (
           <div className="rounded-2xl p-3 space-y-2" style={{ background: 'var(--surface)' }}>
             <p className="text-xs uppercase tracking-widest text-center" style={{ color: 'var(--muted)' }}>Place your bet</p>
 
@@ -504,9 +561,10 @@ function PlayerController() {
             {bet === 3 && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Perfect round = <b style={{ color: 'var(--correct)' }}>DOUBLE your total score</b>. Miss any line = <b style={{ color: 'var(--incorrect)' }}>lose EVERYTHING</b>. 💀</p>}
             {bet === 'swap' && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Perfect round = steal their score. Miss and you lose <b style={{ color: 'var(--incorrect)' }}>750 pts</b>.</p>}
           </div>
+          )}
 
           {/* Swap target picker */}
-          {bet === 'swap' && (
+          {gameState.mode === 'classic' && bet === 'swap' && (
             <div className="rounded-2xl p-3" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
               <p className="text-xs uppercase tracking-widest text-center mb-2 font-black" style={{ color: 'var(--accent)' }}>Who do you want to swap with?</p>
               <div className="flex flex-col gap-2">
@@ -534,13 +592,74 @@ function PlayerController() {
                 <span className="text-xs uppercase tracking-widest" style={{ color: 'var(--muted)' }}>guessing starts in</span>
               </div>
             )}
-            <p className="text-xs" style={{ color: 'var(--muted)' }}>Lock in a bet — guessing opens when the timer hits zero</p>
+            <p className="text-xs" style={{ color: 'var(--muted)' }}>
+              {gameState.mode === 'classic' && 'Lock in a bet — guessing opens when the timer hits zero'}
+              {gameState.mode === 'realfake' && 'Think it over — voting opens when the timer hits zero'}
+              {gameState.mode === 'survival' && (amEliminated ? 'Watch the chaos unfold 🍿' : 'Get it right or lose a life — guessing opens soon')}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Guessing Phase — Real or Cap: one quote, two buttons */}
+      {gameState.phase === 'guessing' && gameState.mode === 'realfake' && gameState.question && gameState.rfClaim && (
+        <div className="flex-1 flex flex-col gap-4 animate-slide-up">
+          <div className="rounded-2xl p-4" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
+            <p className="leading-snug">
+              <span className="font-black" style={{ color: 'var(--accent)' }}>{gameState.rfClaim.claimedSpeakerName}</span>{' '}
+              &ldquo;{promptLines[0]?.lineText}&rdquo;
+            </p>
+          </div>
+          {!rfVote ? (
+            <div className="grid grid-cols-2 gap-3 flex-1 max-h-72">
+              <button onClick={() => voteRf('real')}
+                className="rounded-2xl text-3xl font-black transition-all active:scale-95"
+                style={{ background: 'var(--correct)', color: '#fff' }}>
+                ✅<br />REAL
+              </button>
+              <button onClick={() => voteRf('fake')}
+                className="rounded-2xl text-3xl font-black transition-all active:scale-95"
+                style={{ background: 'var(--incorrect)', color: '#fff' }}>
+                🧢<br />CAP
+              </button>
+            </div>
+          ) : (
+            <div className="text-center rounded-2xl py-6 font-black text-lg" style={{ background: 'var(--surface)', color: 'var(--correct)' }}>
+              ✓ Voted {rfVote === 'real' ? '✅ REAL' : '🧢 CAP'} — waiting for others…
+            </div>
+          )}
+          <div className="flex justify-center gap-2 mt-auto">
+            {REACTION_EMOJIS.map((e) => (
+              <button key={e} onClick={() => sendReaction(e)}
+                className="text-2xl rounded-full w-11 h-11 flex items-center justify-center transition-all active:scale-90"
+                style={{ background: 'var(--surface)' }}>
+                {e}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Guessing Phase — Survival spectator (eliminated) */}
+      {gameState.phase === 'guessing' && gameState.mode === 'survival' && amEliminated && (
+        <div className="flex-1 flex flex-col items-center justify-center gap-4 animate-slide-up">
+          <div className="text-6xl">💀</div>
+          <p className="text-xl font-black">You&apos;re out!</p>
+          <p className="text-sm text-center" style={{ color: 'var(--muted)' }}>Spectate, heckle, and fire reactions at the survivors.</p>
+          <div className="flex justify-center gap-2">
+            {REACTION_EMOJIS.map((e) => (
+              <button key={e} onClick={() => sendReaction(e)}
+                className="text-2xl rounded-full w-11 h-11 flex items-center justify-center transition-all active:scale-90"
+                style={{ background: 'var(--surface)' }}>
+                {e}
+              </button>
+            ))}
           </div>
         </div>
       )}
 
       {/* Guessing Phase — one shared speaker grid, tap a line to target it */}
-      {gameState.phase === 'guessing' && gameState.question && gActiveLineObj && (
+      {gameState.phase === 'guessing' && gameState.mode !== 'realfake' && !amEliminated && gameState.question && gActiveLineObj && (
         <div className="flex-1 flex flex-col gap-3 animate-slide-up">
           {/* Multi-line: compact line picker */}
           {gMulti && (
@@ -597,14 +716,22 @@ function PlayerController() {
                 })}
               </div>
 
-              {/* Bet locked during prompt (Blind Confidence) — read-only reminder */}
-              <div className="rounded-xl px-3 py-2 flex items-center justify-center gap-2 text-xs" style={{ background: 'var(--surface)' }}>
-                <span style={{ color: 'var(--muted)' }}>Bet locked:</span>
-                <span className="font-bold" style={{ color: 'var(--text)' }}>{betLabel}</span>
-                {bet === 'swap' && swapTarget && (
-                  <span className="font-bold" style={{ color: 'var(--accent)' }}>→ {gameState.players.find((p) => p.id === swapTarget)?.name}</span>
-                )}
-              </div>
+              {/* Bet locked during prompt (Blind Confidence) — read-only reminder (classic only) */}
+              {gameState.mode === 'classic' && (
+                <div className="rounded-xl px-3 py-2 flex items-center justify-center gap-2 text-xs" style={{ background: 'var(--surface)' }}>
+                  <span style={{ color: 'var(--muted)' }}>Bet locked:</span>
+                  <span className="font-bold" style={{ color: 'var(--text)' }}>{betLabel}</span>
+                  {bet === 'swap' && swapTarget && (
+                    <span className="font-bold" style={{ color: 'var(--accent)' }}>→ {gameState.players.find((p) => p.id === swapTarget)?.name}</span>
+                  )}
+                </div>
+              )}
+              {/* Survival: lives reminder */}
+              {gameState.mode === 'survival' && (
+                <div className="rounded-xl px-3 py-2 text-center text-xs font-bold" style={{ background: 'var(--surface)' }}>
+                  {'❤️'.repeat(myLives)} <span style={{ color: 'var(--muted)' }}>— a single wrong line costs a life</span>
+                </div>
+              )}
 
               {/* Lock in */}
               {gAssignedCount > 0 && (
@@ -634,10 +761,48 @@ function PlayerController() {
         </div>
       )}
 
+      {/* Reveal Phase — Real or Cap verdict */}
+      {gameState.phase === 'reveal' && gameState.mode === 'realfake' && gameState.rfClaim && (() => {
+        const right = gameState.perfectRound[playerId] === true
+        const truthName = gameState.question?.lines.find((l) => l.lineId === gameState.rfClaim!.lineId)?.speakerName ?? '???'
+        return (
+          <div className="flex-1 flex flex-col gap-4 animate-slide-up">
+            <h2 className="text-2xl font-black text-center">Results</h2>
+            <div className="rounded-2xl p-5 text-center space-y-2"
+              style={{ background: 'var(--surface)', border: `2px solid ${gameState.rfClaim.isReal ? 'var(--correct)' : 'var(--incorrect)'}` }}>
+              <p className="text-3xl font-black" style={{ color: gameState.rfClaim.isReal ? 'var(--correct)' : 'var(--incorrect)' }}>
+                {gameState.rfClaim.isReal ? '✅ It was REAL' : '🧢 It was CAP'}
+              </p>
+              {!gameState.rfClaim.isReal && <p className="text-sm" style={{ color: 'var(--muted)' }}>It was actually <b style={{ color: 'var(--text)' }}>{truthName}</b></p>}
+              <p className="text-lg font-bold" style={{ color: right ? 'var(--correct)' : 'var(--incorrect)' }}>
+                {rfVote === null ? '😴 You didn’t vote' : right ? `You called it! +${gameState.scores[playerId] ?? 0}` : 'You got played 💀'}
+              </p>
+            </div>
+            {gameState.drinking && (
+              <div className="rounded-2xl p-5 text-center animate-bounce-in"
+                style={{ background: right ? 'var(--surface)' : 'var(--accent)', color: right ? 'var(--correct)' : '#000', border: right ? '2px solid var(--correct)' : 'none' }}>
+                <p className="text-2xl font-black">{drinkResultText(computeRfDrink(rfVote ?? undefined, right))}</p>
+              </div>
+            )}
+            <div className="rounded-2xl p-4 text-center" style={{ background: 'var(--surface)' }}>
+              <p className="text-xs uppercase tracking-widest mb-1" style={{ color: 'var(--muted)' }}>Your score</p>
+              <p className="text-4xl font-black">{myScore}</p>
+              {myRank > 0 && <p className="text-sm mt-1" style={{ color: 'var(--muted)' }}>#{myRank} of {gameState.players.length}</p>}
+            </div>
+            <p className="text-center text-sm animate-pulse" style={{ color: 'var(--muted)' }}>Waiting for host…</p>
+          </div>
+        )
+      })()}
+
       {/* Reveal Phase — show the player's own answers, no spoiler of correct names */}
-      {gameState.phase === 'reveal' && gameState.question && (
+      {gameState.phase === 'reveal' && gameState.mode !== 'realfake' && gameState.question && (
         <div className="flex-1 flex flex-col gap-4 animate-slide-up">
           <h2 className="text-2xl font-black text-center">Results</h2>
+          {gameState.mode === 'survival' && (
+            <div className="rounded-2xl p-3 text-center font-black" style={{ background: 'var(--surface)', border: '2px solid var(--incorrect)' }}>
+              {myLives > 0 ? <>{'❤️'.repeat(myLives)} {gameState.perfectRound[playerId] === false && <span style={{ color: 'var(--incorrect)' }}>−1 life!</span>}</> : <span style={{ color: 'var(--incorrect)' }}>💀 ELIMINATED</span>}
+            </div>
+          )}
           <div className="space-y-3">
             {gameState.question.lines.map((line) => {
               const myGuess = myGuesses[line.lineId]
@@ -671,8 +836,8 @@ function PlayerController() {
             })}
           </div>
 
-          {/* Drink prompt (Tipsy Edition) */}
-          {gameState.mode === 'drinking' && (() => {
+          {/* Drink prompt (Tipsy Edition overlay) */}
+          {gameState.drinking && (() => {
             const result = computeRoundDrinks(gameState.question!, (lid) => myGuesses[lid])
             const safe = result.kind === 'safe'
             return (
@@ -707,13 +872,18 @@ function PlayerController() {
 
       {/* Leaderboard */}
       {gameState.phase === 'leaderboard' && (() => {
-        const ranked = gameState.players.slice().sort((a, b) => b.score - a.score)
-        const amLast = gameState.mode === 'drinking' && ranked.length > 1 && ranked[ranked.length - 1].id === playerId
+        // Survival ranks by lives remaining (score as tiebreak); other modes by score.
+        const ranked = gameState.players.slice().sort((a, b) =>
+          gameState.mode === 'survival'
+            ? ((gameState.lives[b.id] ?? 0) - (gameState.lives[a.id] ?? 0)) || (b.score - a.score)
+            : b.score - a.score)
+        const myPos = ranked.findIndex((p) => p.id === playerId) + 1
+        const amLast = gameState.drinking && ranked.length > 1 && ranked[ranked.length - 1].id === playerId
         return (
         <div className="flex-1 flex flex-col items-center justify-center gap-6 animate-bounce-in">
-          <div className="text-6xl">{myRank === 1 ? '🏆' : myRank === 2 ? '🥈' : myRank === 3 ? '🥉' : '🎮'}</div>
+          <div className="text-6xl">{myPos === 1 ? '🏆' : myPos === 2 ? '🥈' : myPos === 3 ? '🥉' : amEliminated ? '💀' : '🎮'}</div>
           <h2 className="text-3xl font-black">
-            {myRank === 1 ? 'You won!' : `#${myRank} place`}
+            {myPos === 1 ? (gameState.mode === 'survival' ? 'You survived!' : 'You won!') : `#${myPos} place`}
           </h2>
           {amLast && (
             <div className="rounded-full px-5 py-2 text-sm font-black" style={{ background: 'var(--incorrect)', color: '#fff' }}>
@@ -729,7 +899,7 @@ function PlayerController() {
                     fontWeight: p.id === playerId ? 900 : 400,
                   }}>
                   <span className="flex items-center gap-1">{['🥇', '🥈', '🥉'][i] ?? `${i + 1}.`} <span>{p.avatar}</span> {p.name}</span>
-                  <span className="font-black">{p.score}</span>
+                  <span className="font-black">{gameState.mode === 'survival' ? ('❤️'.repeat(gameState.lives[p.id] ?? 0) || '💀') : p.score}</span>
                 </div>
               ))}
           </div>

@@ -56,11 +56,11 @@ export function Typewriter({ lines, onComplete, plain, plainClassName }: Typewri
         const visible = Math.min(line.lineText.length, shown - start)
         const typing = shown < start + line.lineText.length
         return (
-          <div key={line.lineId} className="rounded-2xl p-6 space-y-1 animate-slide-up" style={{ background: 'var(--surface)' }}>
-            {line.actionText && <p className="text-sm italic" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
-            <p className="text-xl">
+          <div key={line.lineId} className="rounded-2xl p-8 space-y-1 animate-slide-up" style={{ background: 'var(--surface)' }}>
+            {line.actionText && <p className="text-xl italic" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
+            <p className="text-4xl leading-snug">
               &ldquo;{line.lineText.slice(0, visible)}&rdquo;{typing && <span className="cursor-blink">▋</span>}{' '}
-              {!typing && <span className="text-base font-bold" style={{ color: 'var(--primary-light)' }}>— ???</span>}
+              {!typing && <span className="text-2xl font-bold" style={{ color: 'var(--primary-light)' }}>— ???</span>}
             </p>
           </div>
         )

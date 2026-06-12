@@ -39,8 +39,20 @@ export interface RoundQuestion {
 
 export type GamePhase = 'lobby' | 'prompt' | 'guessing' | 'reveal' | 'leaderboard'
 
-// 'normal' = points only; 'drinking' = Tipsy Edition with drink penalties
-export type GameMode = 'normal' | 'drinking'
+// Game modes (the question format / win condition). Drinking is a separate overlay
+// (GameState.drinking) that stacks on top of any mode.
+//   classic  — who said it, points + confidence bets
+//   realfake — a quote is shown WITH a claimed speaker; vote REAL or CAP, flat points
+//   survival — classic guessing but with lives: miss a round = lose one, last standing wins
+export type GameMode = 'classic' | 'realfake' | 'survival'
+
+// A Real-or-Cap round's claim: the line shown and who it's CLAIMED to be by.
+export interface RfClaim {
+  lineId: number
+  claimedSpeakerId: number
+  claimedSpeakerName: string
+  isReal: boolean // true if the claimed speaker actually said it
+}
 
 export interface Player {
   id: string
@@ -56,6 +68,7 @@ export type Bet = 0.5 | 1 | 2 | 3 | 'swap'
 export interface GameState {
   phase: GamePhase
   mode: GameMode
+  drinking: boolean // Tipsy Edition overlay — stacks on any mode
   roomCode: string
   // Guessable speakers, loaded once by the host at game creation.
   // Players read this from broadcast state instead of querying the DB themselves.
@@ -76,9 +89,14 @@ export interface GameState {
   scores: Record<string, number> // playerId -> score delta this round
   streakBonuses: Record<string, number> // playerId -> streak bonus portion this round
   perfectRound: Record<string, boolean> // playerId -> got every line right this round
-  bets: Record<string, Bet> // playerId -> confidence bet this round
+  bets: Record<string, Bet> // playerId -> confidence bet this round (classic mode only)
   swapTargets: Record<string, string> // playerId -> targetPlayerId (only for 'swap' bet)
   executedSwaps: Array<{ winnerId: string; loserId: string }> // swaps that fired this round
+  // --- Real or Cap mode ---
+  rfClaim: RfClaim | null // this round's claim (null outside realfake mode)
+  rfVotes: Record<string, 'real' | 'fake'> // playerId -> vote this round
+  // --- Survival mode ---
+  lives: Record<string, number> // playerId -> lives remaining (empty outside survival)
 }
 
 // Messages sent over the Supabase Realtime channel
@@ -89,6 +107,7 @@ export type ChannelMessage =
   | { type: 'lock_in'; playerId: string }
   | { type: 'set_bet'; playerId: string; bet: Bet }
   | { type: 'set_swap_target'; playerId: string; targetId: string }
+  | { type: 'rf_vote'; playerId: string; vote: 'real' | 'fake' }
   | { type: 'speakers_sync'; speakers: Speaker[] }
   | { type: 'reaction'; playerId: string; emoji: string }
   | { type: 'join_rejected'; playerId: string; reason: string }

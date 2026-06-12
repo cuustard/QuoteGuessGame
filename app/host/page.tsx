@@ -7,7 +7,8 @@ import { supabase } from '@/lib/supabase'
 import {
   generateRoomCode, fetchSpeakers, fetchRandomConversation,
   buildRoundQuestion, scoreRound, applyScoreDeltas, createInitialGameState,
-  computeRoundDrinks, drinkResultText, roundDrinkCallouts,
+  computeRoundDrinks, computeRfDrink, drinkResultText, roundDrinkCallouts,
+  buildRfClaim, scoreRfRound, applyLifeLoss, aliveIds, SURVIVAL_LIVES,
   TIMER_DURATION_MS,
 } from '@/lib/game'
 import { unlockAudio, playTick, playReveal } from '@/lib/sounds'
@@ -122,7 +123,38 @@ export default function HostPage() {
         speakerName: cur.speakers.find((s) => s.id === revealedAnswers[l.lineId])?.name ?? '???',
       })),
     }
-    const { deltas, streakBonuses, perfectRound, executedSwaps } = scoreRound(cur.question, cur.guesses, cur.players, cur.timerStart ?? Date.now(), cur.timerDuration, cur.lockTimes, cur.bets, cur.swapTargets)
+
+    // Real or Cap: flat points for a correct vote; no bets, streaks, or swaps.
+    if (cur.mode === 'realfake') {
+      if (!cur.rfClaim) return
+      const { deltas, perfectRound } = scoreRfRound(cur.rfClaim, cur.rfVotes, cur.players)
+      const updatedPlayers = cur.players.map((p) => ({ ...p, score: p.score + (deltas[p.id] ?? 0) }))
+      broadcast({
+        ...cur, phase: 'reveal', revealedAnswers, question: questionWithNames,
+        scores: deltas, streakBonuses: {}, perfectRound, executedSwaps: [], players: updatedPlayers,
+      })
+      return
+    }
+
+    // Classic & Survival share line-guess scoring; survival has no bets/swaps (lives are the stakes).
+    const bets = cur.mode === 'survival' ? {} : cur.bets
+    const swapTargets = cur.mode === 'survival' ? {} : cur.swapTargets
+    const { deltas, streakBonuses, perfectRound, executedSwaps } = scoreRound(cur.question, cur.guesses, cur.players, cur.timerStart ?? Date.now(), cur.timerDuration, cur.lockTimes, bets, swapTargets)
+
+    if (cur.mode === 'survival') {
+      // Eliminated players spectate: scores frozen, no further life loss (applyLifeLoss floors at 0).
+      for (const p of cur.players) {
+        if ((cur.lives[p.id] ?? 0) <= 0) { deltas[p.id] = 0; streakBonuses[p.id] = 0 }
+      }
+      const lives = applyLifeLoss(cur.lives, perfectRound)
+      const updatedPlayers = applyScoreDeltas(cur.players, deltas, perfectRound, [])
+      broadcast({
+        ...cur, phase: 'reveal', revealedAnswers, question: questionWithNames,
+        scores: deltas, streakBonuses, perfectRound, executedSwaps: [], players: updatedPlayers, lives,
+      })
+      return
+    }
+
     const updatedPlayers = applyScoreDeltas(cur.players, deltas, perfectRound, executedSwaps)
     broadcast({
       ...cur, phase: 'reveal', revealedAnswers, question: questionWithNames,
@@ -132,8 +164,15 @@ export default function HostPage() {
 
   const checkAllGuessed = useCallback((cur: GameState) => {
     if (!cur.question || cur.players.length === 0) return
+    if (cur.mode === 'realfake') {
+      if (cur.players.every((p) => cur.rfVotes[p.id] !== undefined)) revealAnswers(cur)
+      return
+    }
+    // Survival: only living players need to answer (eliminated spectate).
+    const active = cur.mode === 'survival' ? cur.players.filter((p) => (cur.lives[p.id] ?? 0) > 0) : cur.players
+    if (active.length === 0) return
     const lineIds = cur.question.lines.map((l) => l.lineId)
-    const allDone = cur.players.every((p) => lineIds.every((lid) => cur.guesses[lid]?.[p.id] !== undefined))
+    const allDone = active.every((p) => lineIds.every((lid) => cur.guesses[lid]?.[p.id] !== undefined))
     if (allDone) revealAnswers(cur)
   }, [revealAnswers])
 
@@ -184,6 +223,15 @@ export default function HostPage() {
       commitState((c) => ({ ...c, swapTargets: { ...c.swapTargets, [payload.playerId]: payload.targetId } }))
     })
 
+    channel.on('broadcast', { event: 'rf_vote' }, ({ payload }: { payload: ChannelMessage }) => {
+      if (payload.type !== 'rf_vote') return
+      const cur = stateRef.current
+      if (cur?.phase !== 'guessing' || cur.mode !== 'realfake') return
+      if (!cur.players.find((p) => p.id === payload.playerId)) return
+      const next = commitState((c) => ({ ...c, rfVotes: { ...c.rfVotes, [payload.playerId]: payload.vote } }))
+      checkAllGuessed(next)
+    })
+
     channel.on('broadcast', { event: 'reaction' }, ({ payload }: { payload: ChannelMessage }) => {
       if (payload.type !== 'reaction') return
       const id = reactionIdRef.current++
@@ -197,6 +245,7 @@ export default function HostPage() {
       const cur0 = stateRef.current
       if (cur0?.phase !== 'guessing') return
       if (!cur0.players.find((p) => p.id === payload.playerId)) return
+      if (cur0.mode === 'survival' && (cur0.lives[payload.playerId] ?? 0) <= 0) return // eliminated spectate
       const now = Date.now() // event-time, captured outside the render-pure updater
       const next = commitState((cur) => {
         const guesses = { ...cur.guesses, [payload.lineId]: { ...(cur.guesses[payload.lineId] ?? {}), [payload.playerId]: payload.speakerId } }
@@ -270,7 +319,21 @@ export default function HostPage() {
     channelRef.current = channel
     // Drop back to the lobby of the in-progress game so the host can re-sync players, keeping
     // scores. Re-set speakers so saves from before speakers lived in GameState still work.
-    const resumedState: GameState = { ...resumable.state, phase: 'lobby', speakers: spkrs }
+    // Migrate pre-modes saves: old mode 'normal'/'drinking' → classic (+ drinking flag),
+    // and default the fields those snapshots don't have.
+    const legacyMode = resumable.state.mode as GameMode | 'normal' | 'drinking'
+    const mode: GameMode = legacyMode === 'normal' || legacyMode === 'drinking' ? 'classic' : legacyMode
+    const resumedState: GameState = {
+      ...resumable.state,
+      phase: 'lobby',
+      speakers: spkrs,
+      mode,
+      drinking: resumable.state.drinking ?? legacyMode === 'drinking',
+      rfClaim: resumable.state.rfClaim ?? null,
+      rfVotes: resumable.state.rfVotes ?? {},
+      lives: resumable.state.lives ?? {},
+      lockTimes: resumable.state.lockTimes ?? {},
+    }
     try {
       await subscribeAndWait(channel)
       setResumable(null)
@@ -298,6 +361,12 @@ export default function HostPage() {
     broadcast({ ...cur, mode })
   }
 
+  function setDrinking(drinking: boolean) {
+    const cur = stateRef.current
+    if (!cur || cur.phase !== 'lobby') return
+    broadcast({ ...cur, drinking })
+  }
+
   // advance=false re-rolls the current round (used by Skip)
   async function startNextRound(advance = true) {
     const cur = stateRef.current
@@ -308,8 +377,17 @@ export default function HostPage() {
     if (!conv) { broadcast({ ...cur, phase: 'leaderboard' }); return }
     usedConvIdsRef.current = [...usedConvIdsRef.current, conv.id]
     const question = buildRoundQuestion(conv)
+    // Real or Cap: attribute one line to a claimed speaker (50/50 truth or cap).
+    const rfClaim = cur.mode === 'realfake' ? buildRfClaim(question, cur.speakers) : null
+    // Survival: deal everyone their lives when the game starts (first round out of the lobby).
+    const lives = cur.mode === 'survival' && cur.phase === 'lobby'
+      ? Object.fromEntries(cur.players.map((p) => [p.id, SURVIVAL_LIVES]))
+      : cur.lives
     const contextChars = question.context?.length ?? 0
-    const quoteChars = question.lines.reduce((a, l) => a + l.lineText.length, 0)
+    const quoteChars = (cur.mode === 'realfake' && rfClaim
+      ? question.lines.filter((l) => l.lineId === rfClaim.lineId)
+      : question.lines
+    ).reduce((a, l) => a + l.lineText.length, 0)
     const promptMs = Math.min(PROMPT_MAX_MS, Math.max(PROMPT_MIN_MS, (contextChars + quoteChars) * TYPE_SPEED_MS + PROMPT_BUFFER_MS))
     // eslint-disable-next-line react-hooks/purity -- event-driven, not a render path
     const promptEnd = Date.now() + promptMs
@@ -319,6 +397,7 @@ export default function HostPage() {
       currentRound: advance ? cur.currentRound + 1 : cur.currentRound,
       promptEnd,
       question, guesses: {}, lockTimes: {}, timerStart: null, revealedAnswers: {}, scores: {}, streakBonuses: {}, perfectRound: {}, bets: {}, swapTargets: {}, executedSwaps: [],
+      rfClaim, rfVotes: {}, lives,
     }
     setTimeLeft(nextState.timerDuration)
     broadcast(nextState)
@@ -365,7 +444,9 @@ export default function HostPage() {
   function continueAfterReveal() {
     const cur = stateRef.current
     if (!cur) return
-    if (cur.currentRound >= cur.totalRounds) broadcast({ ...cur, phase: 'leaderboard' })
+    // Survival ends early once one (or zero) players are left standing.
+    const survivalOver = cur.mode === 'survival' && aliveIds(cur.lives).length <= 1
+    if (survivalOver || cur.currentRound >= cur.totalRounds) broadcast({ ...cur, phase: 'leaderboard' })
     else startNextRound(true)
   }
 
@@ -380,6 +461,8 @@ export default function HostPage() {
     broadcast({
       ...createInitialGameState(cur.roomCode, cur.totalRounds, cur.speakers),
       mode: cur.mode,
+      drinking: cur.drinking,
+      timerDuration: cur.timerDuration,
       players: resetPlayers,
     })
   }
@@ -452,22 +535,22 @@ export default function HostPage() {
     <main className="p-8 flex flex-col gap-6" style={{ width: '1920px', height: '1080px', overflow: 'hidden' }}>
       {/* Header */}
       <div className="flex items-center justify-between gap-2 flex-wrap">
-        <div className="text-xl sm:text-2xl font-black flex items-center gap-2" style={{ color: 'var(--primary-light)' }}>
+        <div className="text-4xl font-black flex items-center gap-2" style={{ color: 'var(--primary-light)' }}>
           Who Said It?
-          {state.mode === 'drinking' && <span className="text-sm" title="Tipsy Edition">🍺</span>}
+          {state.drinking && <span className="text-2xl" title="Tipsy Edition">🍺</span>}
         </div>
-        <div className="flex items-center gap-3 sm:gap-6">
+        <div className="flex items-center gap-5 sm:gap-8">
           {state.phase !== 'lobby' && state.phase !== 'leaderboard' && (
-            <span className="text-sm whitespace-nowrap" style={{ color: 'var(--muted)' }}>Round {state.currentRound}/{state.totalRounds}</span>
+            <span className="text-2xl font-bold whitespace-nowrap" style={{ color: 'var(--muted)' }}>Round {state.currentRound}/{state.totalRounds}</span>
           )}
           {(state.phase === 'prompt' || state.phase === 'guessing') && (
             <button onClick={skipRound}
-              className="rounded-lg px-3 py-2 text-sm font-bold transition-all hover:scale-105"
+              className="rounded-lg px-5 py-2.5 text-xl font-bold transition-all hover:scale-105"
               style={{ background: 'var(--surface)', color: 'var(--muted)' }}>
               Skip ⏭
             </button>
           )}
-          <div className="rounded-xl px-3 py-2 sm:px-4 text-xl sm:text-2xl font-black tracking-widest" style={{ background: 'var(--surface)' }}>
+          <div className="rounded-xl px-5 py-3 text-4xl font-black tracking-widest" style={{ background: 'var(--surface)' }}>
             {state.roomCode}
           </div>
         </div>
@@ -479,20 +562,20 @@ export default function HostPage() {
       {/* Lobby */}
       {state.phase === 'lobby' && (
         <div className="flex-1 flex flex-col items-center justify-center gap-8 animate-slide-up">
-          <div className="text-center space-y-2">
-            <h2 className="text-3xl font-black">Waiting for players…</h2>
-            <p style={{ color: 'var(--muted)' }}>Scan the code or enter it manually</p>
+          <div className="text-center space-y-3">
+            <h2 className="text-5xl font-black">Waiting for players…</h2>
+            <p className="text-2xl" style={{ color: 'var(--muted)' }}>Scan the code or enter it manually</p>
           </div>
-          <div className="flex flex-col sm:flex-row items-center gap-8">
+          <div className="flex flex-col sm:flex-row items-center gap-10">
             <JoinQR roomCode={state.roomCode} />
-            <div className="text-7xl font-black tracking-[0.3em]" style={{ color: 'var(--accent)' }}>{state.roomCode}</div>
+            <div className="text-8xl font-black tracking-[0.3em]" style={{ color: 'var(--accent)' }}>{state.roomCode}</div>
           </div>
 
-          <div className="flex flex-wrap gap-3 justify-center max-w-2xl min-h-[3rem]">
+          <div className="flex flex-wrap gap-3 justify-center max-w-4xl min-h-[3rem]">
             {state.players.map((p) => {
               const off = presenceReady && !presentIds.has(p.id)
               return (
-                <div key={p.id} className="rounded-full px-5 py-2 font-bold animate-bounce-in flex items-center gap-1"
+                <div key={p.id} className="rounded-full px-6 py-3 text-2xl font-bold animate-bounce-in flex items-center gap-2"
                   style={{ background: 'var(--surface)', border: `2px solid ${off ? 'var(--muted)' : 'var(--primary)'}`, opacity: off ? 0.5 : 1 }}>
                   <span>{p.avatar}</span>{p.name}{off && <span title="disconnected">📴</span>}
                 </div>
@@ -501,11 +584,11 @@ export default function HostPage() {
           </div>
 
           {/* Round count selector */}
-          <div className="flex items-center gap-3">
-            <span className="text-sm" style={{ color: 'var(--muted)' }}>Rounds:</span>
+          <div className="flex items-center gap-4">
+            <span className="text-2xl" style={{ color: 'var(--muted)' }}>Rounds:</span>
             {ROUND_OPTIONS.map((n) => (
               <button key={n} onClick={() => setRoundCount(n)}
-                className="rounded-lg px-4 py-2 font-bold transition-all"
+                className="rounded-lg px-6 py-3 text-xl font-bold transition-all"
                 style={{
                   background: state.totalRounds === n ? 'var(--primary)' : 'var(--surface)',
                   color: state.totalRounds === n ? '#fff' : 'var(--muted)',
@@ -514,11 +597,11 @@ export default function HostPage() {
           </div>
 
           {/* Timer duration selector */}
-          <div className="flex items-center gap-3">
-            <span className="text-sm" style={{ color: 'var(--muted)' }}>Timer:</span>
+          <div className="flex items-center gap-4">
+            <span className="text-2xl" style={{ color: 'var(--muted)' }}>Timer:</span>
             {TIMER_OPTIONS_SEC.map((s) => (
               <button key={s} onClick={() => setTimerDuration(s * 1000)}
-                className="rounded-lg px-4 py-2 font-bold transition-all"
+                className="rounded-lg px-6 py-3 text-xl font-bold transition-all"
                 style={{
                   background: state.timerDuration === s * 1000 ? 'var(--primary)' : 'var(--surface)',
                   color: state.timerDuration === s * 1000 ? '#fff' : 'var(--muted)',
@@ -526,31 +609,46 @@ export default function HostPage() {
             ))}
           </div>
 
-          {/* Game mode toggle */}
-          <div className="flex flex-col items-center gap-2">
-            <div className="flex items-center gap-3">
-              <span className="text-sm" style={{ color: 'var(--muted)' }}>Mode:</span>
-              <button onClick={() => setMode('normal')}
-                className="rounded-lg px-4 py-2 font-bold transition-all"
-                style={{ background: state.mode === 'normal' ? 'var(--primary)' : 'var(--surface)', color: state.mode === 'normal' ? '#fff' : 'var(--muted)' }}>
-                🏆 Classic
-              </button>
-              <button onClick={() => setMode('drinking')}
-                className="rounded-lg px-4 py-2 font-bold transition-all"
-                style={{ background: state.mode === 'drinking' ? 'var(--accent)' : 'var(--surface)', color: state.mode === 'drinking' ? '#000' : 'var(--muted)' }}>
-                🍺 Tipsy Edition
-              </button>
+          {/* Game mode selector */}
+          <div className="flex flex-col items-center gap-3">
+            <div className="flex items-center gap-4">
+              <span className="text-2xl" style={{ color: 'var(--muted)' }}>Mode:</span>
+              {([
+                { m: 'classic' as GameMode, label: '🏆 Classic' },
+                { m: 'realfake' as GameMode, label: '🕵 Real or Cap' },
+                { m: 'survival' as GameMode, label: '💀 Survival' },
+              ]).map(({ m, label }) => (
+                <button key={m} onClick={() => setMode(m)}
+                  className="rounded-lg px-6 py-3 text-xl font-bold transition-all"
+                  style={{ background: state.mode === m ? 'var(--primary)' : 'var(--surface)', color: state.mode === m ? '#fff' : 'var(--muted)' }}>
+                  {label}
+                </button>
+              ))}
             </div>
-            {state.mode === 'drinking' && (
-              <p className="text-xs text-center max-w-md" style={{ color: 'var(--muted)' }}>
-                Wrong line = a sip · whiff a whole dialogue = a shot · 21+, drink responsibly, know your limits.
+            <p className="text-lg text-center max-w-2xl" style={{ color: 'var(--muted)' }}>
+              {state.mode === 'classic' && 'Guess who said it — points, streaks & confidence bets.'}
+              {state.mode === 'realfake' && 'A quote appears with a name on it. Vote REAL or CAP — flat 500 points per correct call.'}
+              {state.mode === 'survival' && `Everyone starts with ${SURVIVAL_LIVES} lives. Miss a round = lose one. Last one standing wins.`}
+            </p>
+          </div>
+
+          {/* Drinking overlay toggle — stacks on any mode */}
+          <div className="flex flex-col items-center gap-3">
+            <button onClick={() => setDrinking(!state.drinking)}
+              className="rounded-lg px-6 py-3 text-xl font-bold transition-all"
+              style={{ background: state.drinking ? 'var(--accent)' : 'var(--surface)', color: state.drinking ? '#000' : 'var(--muted)' }}>
+              🍺 Tipsy Edition: {state.drinking ? 'ON' : 'OFF'}
+            </button>
+            {state.drinking && (
+              <p className="text-lg text-center max-w-xl" style={{ color: 'var(--muted)' }}>
+                Wrong = a sip · whiff it all = a shot · 21+, drink responsibly, know your limits.
               </p>
             )}
           </div>
 
           {state.players.length > 0 && (
             <button onClick={() => startNextRound(true)}
-              className="rounded-2xl px-12 py-4 text-xl font-black transition-all hover:scale-105"
+              className="rounded-2xl px-16 py-6 text-3xl font-black transition-all hover:scale-105"
               style={{ background: 'var(--primary)', color: '#fff' }}>
               Start Game ({state.players.length} player{state.players.length !== 1 ? 's' : ''})
             </button>
@@ -563,25 +661,36 @@ export default function HostPage() {
         const conv = state.question
         const hasContext = !!conv.context
         const contextDone = !hasContext || contextDoneForConv === conv.conversationId
+        // Real or Cap shows ONLY the claimed line (the rest of the convo would give it away).
+        const promptLines = state.mode === 'realfake' && state.rfClaim
+          ? conv.lines.filter((l) => l.lineId === state.rfClaim!.lineId)
+          : conv.lines
         return (
-          <div className="flex-1 flex flex-col items-center justify-center gap-6 animate-slide-up max-w-3xl mx-auto w-full">
+          <div className="flex-1 flex flex-col items-center justify-center gap-8 animate-slide-up max-w-6xl mx-auto w-full">
             <ContextBar context={null} happenedAt={conv.happenedAt} />
             {hasContext && (
               <Typewriter
                 key={`ctx-${conv.conversationId}`}
                 plain
-                plainClassName="text-sm italic w-full"
+                plainClassName="text-2xl italic w-full text-center"
                 lines={[{ lineId: -1, lineText: `📍 ${conv.context}`, actionText: null }]}
                 onComplete={() => setContextDoneForConv(conv.conversationId)}
               />
             )}
             {contextDone && (
-              <Typewriter key={conv.conversationId} lines={conv.lines} />
+              <Typewriter key={conv.conversationId} lines={promptLines} />
             )}
-            <div className="flex items-center gap-3">
-              <p className="text-lg font-bold animate-pulse" style={{ color: 'var(--accent)' }}>Get ready to guess…</p>
+            {contextDone && state.mode === 'realfake' && state.rfClaim && (
+              <div className="rounded-2xl px-8 py-5 text-center animate-slide-up" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
+                <p className="text-3xl font-black" style={{ color: 'var(--accent)' }}>
+                  🕵 {state.rfClaim.claimedSpeakerName} said this… <span className="text-white">REAL or CAP?</span>
+                </p>
+              </div>
+            )}
+            <div className="flex items-center gap-4">
+              <p className="text-3xl font-bold animate-pulse" style={{ color: 'var(--accent)' }}>Get ready to guess…</p>
               {promptCountdown !== null && promptCountdown > 0 && (
-                <span className="text-2xl font-black tabular-nums" style={{ color: 'var(--accent)' }}>{promptCountdown}</span>
+                <span className="text-5xl font-black tabular-nums" style={{ color: 'var(--accent)' }}>{promptCountdown}</span>
               )}
             </div>
           </div>
@@ -590,19 +699,27 @@ export default function HostPage() {
 
       {/* Guessing Phase */}
       {state.phase === 'guessing' && state.question && (
-        <div className="flex-1 flex flex-col gap-6 max-w-3xl mx-auto w-full">
+        <div className="flex-1 flex flex-col gap-8 max-w-6xl mx-auto w-full">
           <TimerBar timeLeft={timeLeft} total={state.timerDuration} />
           <ContextBar context={state.question.context} happenedAt={state.question.happenedAt} small />
-          <div className="space-y-4">
-            {state.question.lines.map((line) => (
-              <div key={line.lineId} className="rounded-2xl p-5" style={{ background: 'var(--surface)' }}>
-                {line.actionText && <p className="text-xs italic mb-1" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
-                <p>&ldquo;{line.lineText}&rdquo;{' '}
-                  <span className="text-sm font-bold" style={{ color: 'var(--primary-light)' }}>— ???</span>
+          <div className="space-y-5">
+            {(state.mode === 'realfake' && state.rfClaim
+              ? state.question.lines.filter((l) => l.lineId === state.rfClaim!.lineId)
+              : state.question.lines
+            ).map((line) => (
+              <div key={line.lineId} className="rounded-2xl p-7" style={{ background: 'var(--surface)' }}>
+                {line.actionText && <p className="text-lg italic mb-2" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
+                <p className="text-4xl leading-relaxed">&ldquo;{line.lineText}&rdquo;{' '}
+                  <span className="text-3xl font-bold" style={{ color: state.mode === 'realfake' ? 'var(--accent)' : 'var(--primary-light)' }}>
+                    — {state.mode === 'realfake' && state.rfClaim ? state.rfClaim.claimedSpeakerName : '???'}
+                  </span>
                 </p>
               </div>
             ))}
           </div>
+          {state.mode === 'realfake' && (
+            <p className="text-3xl font-black text-center animate-pulse" style={{ color: 'var(--accent)' }}>REAL or CAP? Vote on your phone!</p>
+          )}
           <div className="mt-auto lg:hidden">
             <p className="text-xs uppercase tracking-widest mb-3" style={{ color: 'var(--muted)' }}>Answers in</p>
             <div className="flex flex-wrap gap-2">
@@ -624,8 +741,8 @@ export default function HostPage() {
 
       {/* Reveal Phase */}
       {state.phase === 'reveal' && state.question && (
-        <div className="flex-1 flex flex-col gap-6 max-w-3xl mx-auto w-full animate-slide-up">
-          <h2 className="text-3xl font-black text-center">The Answer!</h2>
+        <div className="flex-1 flex flex-col gap-6 max-w-6xl mx-auto w-full animate-slide-up">
+          <h2 className="text-5xl font-black text-center">The Answer!</h2>
           <ContextBar context={null} happenedAt={state.question.happenedAt} small />
 
           <div className="space-y-4">
@@ -637,30 +754,30 @@ export default function HostPage() {
                 guessId: state.guesses[line.lineId]?.[p.id],
               }))
               return (
-                <div key={line.lineId} className="rounded-2xl p-5 transition-all"
+                <div key={line.lineId} className="rounded-2xl p-7 transition-all"
                   style={{ background: 'var(--surface)', border: `2px solid ${shown ? 'var(--correct)' : 'transparent'}` }}>
                   {/* Context + Quote + Author inline */}
-                  {idx === 0 && state.question?.context && <p className="text-sm italic mb-2" style={{ color: 'var(--muted)' }}>📍 {state.question.context}</p>}
-                  {line.actionText && <p className="text-xs italic mb-2" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
-                  <p className="text-xl font-medium" style={{ color: 'var(--text)' }}>
+                  {idx === 0 && state.question?.context && <p className="text-lg italic mb-2" style={{ color: 'var(--muted)' }}>📍 {state.question.context}</p>}
+                  {line.actionText && <p className="text-lg italic mb-2" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
+                  <p className="text-3xl leading-relaxed font-medium" style={{ color: 'var(--text)' }}>
                     &ldquo;{line.lineText}&rdquo;{' '}
-                    <span className="text-base font-bold" style={{ color: shown ? '#f59e0b' : 'var(--muted)' }}>
+                    <span className="text-2xl font-bold" style={{ color: shown ? '#f59e0b' : 'var(--muted)' }}>
                       — {shown ? line.speakerName : '???'}
                     </span>
                   </p>
 
-                  {/* Guesses */}
-                  {shown && lineGuesses.length > 0 && (() => {
+                  {/* Guesses (not in Real or Cap — votes are shown in the verdict panel) */}
+                  {shown && state.mode !== 'realfake' && lineGuesses.length > 0 && (() => {
                     const correctGuesses = lineGuesses.filter(({ guessId }) => guessId === line.speakerId)
                     const incorrectGuesses = lineGuesses.filter(({ guessId }) => guessId !== line.speakerId)
                     return (
                       <div className="animate-slide-up" style={{ borderTop: '1px solid rgba(148,163,184,0.15)', marginTop: '0.75rem', paddingTop: '0.75rem' }}>
                         {correctGuesses.length > 0 && (
-                          <div className="mb-2">
-                            <p className="text-[10px] uppercase tracking-widest mb-1.5 font-bold" style={{ color: 'rgba(74,222,128,0.8)' }}>Correct</p>
+                          <div className="mb-3">
+                            <p className="text-sm uppercase tracking-widest mb-2 font-bold" style={{ color: 'rgba(74,222,128,0.8)' }}>Correct</p>
                             <div className="flex flex-wrap gap-2">
                               {correctGuesses.map(({ player }) => (
-                                <span key={player.id} className="inline-flex items-center gap-1 rounded-full px-3 py-0.5 text-xs font-bold"
+                                <span key={player.id} className="inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-xl font-bold"
                                   style={{ background: 'var(--correct)', color: '#fff' }}>
                                   {player.avatar} {player.name}
                                 </span>
@@ -670,12 +787,12 @@ export default function HostPage() {
                         )}
                         {incorrectGuesses.length > 0 && (
                           <div>
-                            <p className="text-[10px] uppercase tracking-widest mb-1.5 font-bold" style={{ color: 'rgba(100,116,139,0.8)' }}>Incorrect</p>
+                            <p className="text-sm uppercase tracking-widest mb-2 font-bold" style={{ color: 'rgba(100,116,139,0.8)' }}>Incorrect</p>
                             <div className="flex flex-wrap gap-2">
                               {incorrectGuesses.map(({ player, guessId }) => {
                                 const guessName = state.speakers.find((s) => s.id === guessId)?.name ?? '—'
                                 return (
-                                  <span key={player.id} className="inline-flex items-center gap-1 rounded-full px-3 py-0.5 text-xs font-bold border"
+                                  <span key={player.id} className="inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-xl font-bold border"
                                     style={{ background: 'rgba(30,41,59,0.5)', borderColor: 'rgba(51,65,85,1)' }}>
                                     <span style={{ color: 'rgb(203,213,225)' }}>{player.avatar} {player.name}</span>
                                     <span style={{ color: 'rgb(100,116,139)' }}> ➔ {guessName}</span>
@@ -722,16 +839,57 @@ export default function HostPage() {
             </div>
           </div>
 
+          {/* Real or Cap verdict */}
+          {state.mode === 'realfake' && state.rfClaim && (
+            <div className="rounded-2xl p-6 space-y-3 animate-slide-up" style={{ background: 'var(--surface)', border: `3px solid ${state.rfClaim.isReal ? 'var(--correct)' : 'var(--incorrect)'}` }}>
+              <p className="text-4xl font-black text-center" style={{ color: state.rfClaim.isReal ? 'var(--correct)' : 'var(--incorrect)' }}>
+                {state.rfClaim.isReal ? '✅ REAL — they really said it!' : `🧢 CAP! That was ${state.question.lines.find((l) => l.lineId === state.rfClaim!.lineId)?.speakerName ?? '???'}`}
+              </p>
+              <div className="flex flex-wrap gap-2 justify-center">
+                {state.players.map((p) => {
+                  const vote = state.rfVotes[p.id]
+                  const right = state.perfectRound[p.id] === true
+                  return (
+                    <span key={p.id} className="inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-xl font-bold"
+                      style={{ background: right ? 'var(--correct)' : 'rgba(30,41,59,0.5)', color: right ? '#fff' : 'rgb(148,163,184)', border: right ? 'none' : '1px solid rgba(51,65,85,1)' }}>
+                      {p.avatar} {p.name} — {vote === undefined ? '😴 no vote' : vote === 'real' ? 'REAL' : 'CAP'}
+                    </span>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Survival lives */}
+          {state.mode === 'survival' && (
+            <div className="rounded-2xl p-6 animate-slide-up" style={{ background: 'var(--surface)', border: '2px solid var(--incorrect)' }}>
+              <p className="text-lg uppercase tracking-widest mb-3 font-black" style={{ color: 'var(--incorrect)' }}>💀 Lives</p>
+              <div className="flex flex-wrap gap-3">
+                {state.players.map((p) => {
+                  const n = state.lives[p.id] ?? 0
+                  const lostThisRound = state.perfectRound[p.id] === false && n > 0
+                  return (
+                    <span key={p.id} className="inline-flex items-center gap-2 rounded-full px-4 py-1.5 text-2xl font-bold"
+                      style={{ background: n > 0 ? 'rgba(255,255,255,0.06)' : 'rgba(239,68,68,0.18)', opacity: n > 0 ? 1 : 0.7 }}>
+                      {p.avatar} {p.name} {n > 0 ? '❤️'.repeat(n) : '💀 OUT'}
+                      {lostThisRound && <span className="text-base" style={{ color: 'var(--incorrect)' }}>−1</span>}
+                    </span>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
           {/* Point swap callouts */}
           {state.executedSwaps.length > 0 && (
-            <div className="rounded-2xl p-4 space-y-2" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
-              <p className="text-xs uppercase tracking-widest font-black" style={{ color: 'var(--accent)' }}>🔀 Point Swap!</p>
+            <div className="rounded-2xl p-5 space-y-2" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
+              <p className="text-lg uppercase tracking-widest font-black" style={{ color: 'var(--accent)' }}>🔀 Point Swap!</p>
               {state.executedSwaps.map(({ winnerId, loserId }) => {
                 const winner = state.players.find((p) => p.id === winnerId)
                 const loser = state.players.find((p) => p.id === loserId)
                 if (!winner || !loser) return null
                 return (
-                  <p key={winnerId} className="text-sm font-bold">
+                  <p key={winnerId} className="text-2xl font-bold">
                     {winner.avatar} {winner.name} swapped points with {loser.avatar} {loser.name}!
                   </p>
                 )
@@ -739,17 +897,19 @@ export default function HostPage() {
             </div>
           )}
 
-          {/* Drinks this round (Tipsy Edition) */}
-          {state.mode === 'drinking' && (
-            <div className="rounded-2xl p-5" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
-              <p className="text-xs uppercase tracking-widest mb-3 font-black" style={{ color: 'var(--accent)' }}>🍺 Drink Up</p>
+          {/* Drinks this round (Tipsy Edition overlay) */}
+          {state.drinking && (
+            <div className="rounded-2xl p-6" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
+              <p className="text-lg uppercase tracking-widest mb-3 font-black" style={{ color: 'var(--accent)' }}>🍺 Drink Up</p>
               <div className="space-y-2">
                 {state.players.map((p) => {
-                  const result = computeRoundDrinks(state.question!, (lid) => state.guesses[lid]?.[p.id])
+                  const result = state.mode === 'realfake'
+                    ? computeRfDrink(state.rfVotes[p.id], state.perfectRound[p.id] === true)
+                    : computeRoundDrinks(state.question!, (lid) => state.guesses[lid]?.[p.id])
                   return (
-                    <div key={p.id} className="flex justify-between items-center">
-                      <span className="font-bold flex items-center gap-1"><span>{p.avatar}</span>{p.name}</span>
-                      <span className="text-sm font-bold" style={{ color: result.kind === 'safe' ? 'var(--correct)' : 'var(--accent)' }}>
+                    <div key={p.id} className="flex justify-between items-center text-2xl">
+                      <span className="font-bold flex items-center gap-2"><span>{p.avatar}</span>{p.name}</span>
+                      <span className="font-bold" style={{ color: result.kind === 'safe' ? 'var(--correct)' : 'var(--accent)' }}>
                         {drinkResultText(result)}
                       </span>
                     </div>
@@ -757,15 +917,15 @@ export default function HostPage() {
                 })}
               </div>
               {roundDrinkCallouts(state).map((c, i) => (
-                <p key={i} className="text-sm font-bold mt-3 text-center" style={{ color: 'var(--accent)' }}>{c}</p>
+                <p key={i} className="text-xl font-bold mt-3 text-center" style={{ color: 'var(--accent)' }}>{c}</p>
               ))}
             </div>
           )}
 
           <button onClick={continueAfterReveal}
-            className="rounded-2xl py-4 text-xl font-black transition-all hover:scale-105"
+            className="rounded-2xl py-6 text-3xl font-black transition-all hover:scale-105"
             style={{ background: 'var(--primary)', color: '#fff' }}>
-            {state.currentRound >= state.totalRounds ? 'See Final Results' : 'Next Round →'}
+            {state.currentRound >= state.totalRounds || (state.mode === 'survival' && aliveIds(state.lives).length <= 1) ? 'See Final Results' : 'Next Round →'}
           </button>
         </div>
       )}
@@ -773,16 +933,16 @@ export default function HostPage() {
       {/* Leaderboard */}
       {state.phase === 'leaderboard' && (
         <div className="flex-1 flex flex-col items-center justify-center gap-8">
-          <h2 className="text-4xl sm:text-5xl font-black text-center animate-bounce-in" style={{ color: 'var(--accent)' }}>🏆 Final Results</h2>
-          <Podium players={state.players} mode={state.mode} />
-          <div className="flex flex-col items-center gap-3">
+          <h2 className="text-6xl font-black text-center animate-bounce-in" style={{ color: 'var(--accent)' }}>🏆 Final Results</h2>
+          <Podium players={state.players} drinking={state.drinking} lives={state.mode === 'survival' ? state.lives : undefined} />
+          <div className="flex flex-col items-center gap-4">
             <button onClick={playAgain}
-              className="rounded-2xl px-10 py-4 text-lg font-black transition-all hover:scale-105"
+              className="rounded-2xl px-12 py-5 text-2xl font-black transition-all hover:scale-105"
               style={{ background: 'var(--primary)', color: '#fff' }}>
               🔄 New Game (same players)
             </button>
             <button onClick={() => { localStorage.removeItem(STORAGE_KEY); window.location.reload() }}
-              className="text-sm underline" style={{ color: 'var(--muted)' }}>
+              className="text-lg underline" style={{ color: 'var(--muted)' }}>
               End session &amp; reset
             </button>
           </div>

@@ -4,7 +4,13 @@
       "PowerShell(cd D:\\\\github\\\\QuoteGuessGame; \\(Get-Content app\\\\play\\\\page.tsx\\) -replace 'playerId\\\\.current', 'playerId' | Set-Content app\\\\play\\\\page.tsx -Encoding utf8)",
       "PowerShell(npx tsc --noEmit -p D:\\\\github\\\\QuoteGuessGame\\\\tsconfig.json 2>&1)",
       "Bash(npx tsc *)",
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(curl -s -D - -o /dev/null \"https://zcrfshnefuhzpyuhfxiz.supabase.co/rest/v1/speakers?select=id\" -H \"apikey: sb_publishable_LT4hEi2PrpT9MLZcDWpBtw_lb_1Ggr6\" -H \"Prefer: count=exact\" -H \"Range: 0-0\")",
+      "Bash(curl -s \"https://zcrfshnefuhzpyuhfxiz.supabase.co/rest/v1/dialogue_lines?select=conversation_id,speaker_id,line_text&speaker_id=in.\\(1,6\\)\" -H \"apikey: sb_publishable_LT4hEi2PrpT9MLZcDWpBtw_lb_1Ggr6\")",
+      "Bash(curl -s -D - -o /dev/null \"https://zcrfshnefuhzpyuhfxiz.supabase.co/rest/v1/dialogue_lines?select=id&speaker_id=is.null\" -H \"apikey: sb_publishable_LT4hEi2PrpT9MLZcDWpBtw_lb_1Ggr6\" -H \"Prefer: count=exact\" -H \"Range: 0-0\")",
+      "Bash(curl -s \"https://zcrfshnefuhzpyuhfxiz.supabase.co/rest/v1/dialogue_lines?select=conversation_id,id,line_text&speaker_id=is.null\" -H \"apikey: sb_publishable_LT4hEi2PrpT9MLZcDWpBtw_lb_1Ggr6\")",
+      "Bash(curl -s \"https://zcrfshnefuhzpyuhfxiz.supabase.co/rest/v1/dialogue_lines?select=conversation_id,speaker_id&or=\\(speaker_id.is.null,speaker_id.not.in.\\(2,3,4,5,7\\)\\)\" -H \"apikey: sb_publishable_LT4hEi2PrpT9MLZcDWpBtw_lb_1Ggr6\")",
+      "Bash(curl -s -D - -o /dev/null https://zcrfshnefuhzpyuhfxiz.supabase.co/rest/v1/conversations?select=id -H 'apikey: sb_publishable_LT4hEi2PrpT9MLZcDWpBtw_lb_1Ggr6' -H 'Prefer: count=exact' -H 'Range: 0-0')"
     ]
   }
 }

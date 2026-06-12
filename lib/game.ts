@@ -1,5 +1,5 @@
 import { supabase } from './supabase'
-import type { Bet, Conversation, RoundQuestion, Speaker, GameState, Player } from './types'
+import type { Bet, Conversation, RoundQuestion, RfClaim, Speaker, GameState, Player } from './types'
 
 export function generateRoomCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -29,21 +29,26 @@ export async function fetchSpeakers(): Promise<Speaker[]> {
   return (await fetchSpeakersRaw()).filter((s) => !isOmitted(s.name))
 }
 
-// Cache the set of conversations that contain an omitted speaker (stable per session).
-let _omittedConvIds: number[] | null = null
-async function getOmittedConversationIds(): Promise<number[]> {
-  if (_omittedConvIds) return _omittedConvIds
-  const spk = await fetchSpeakersRaw()
-  const omittedIds = spk.filter((s) => isOmitted(s.name)).map((s) => s.id)
-  if (omittedIds.length === 0) { _omittedConvIds = []; return _omittedConvIds }
-  const { data: lines } = await supabase.from('dialogue_lines').select('conversation_id').in('speaker_id', omittedIds)
-  _omittedConvIds = [...new Set((lines ?? []).map((l) => l.conversation_id))]
-  return _omittedConvIds
+// Cache the set of unplayable conversations (stable per session). A conversation is unplayable
+// if ANY of its lines is spoken by a non-guessable speaker — i.e. an unassigned (null) speaker,
+// an omitted speaker, or an orphaned id. Such a line's answer can't be revealed or guessed, so
+// the whole conversation is skipped from selection.
+let _excludedConvIds: number[] | null = null
+async function getExcludedConversationIds(): Promise<number[]> {
+  if (_excludedConvIds) return _excludedConvIds
+  const guessableIds = (await fetchSpeakers()).map((s) => s.id)
+  const orFilter = guessableIds.length > 0
+    ? `speaker_id.is.null,speaker_id.not.in.(${guessableIds.join(',')})`
+    : 'speaker_id.is.null'
+  const { data: lines, error } = await supabase.from('dialogue_lines').select('conversation_id').or(orFilter)
+  if (error) throw error // fail loud rather than silently leaking unplayable conversations
+  _excludedConvIds = [...new Set((lines ?? []).map((l) => l.conversation_id))]
+  return _excludedConvIds
 }
 
 export async function fetchRandomConversation(excludeIds: number[] = []): Promise<Conversation | null> {
-  const omitted = await getOmittedConversationIds()
-  const exclude = [...new Set([...excludeIds, ...omitted])]
+  const excluded = await getExcludedConversationIds()
+  const exclude = [...new Set([...excludeIds, ...excluded])]
 
   // Count available conversations
   let countQuery = supabase.from('conversations').select('*', { count: 'exact', head: true })
@@ -105,6 +110,12 @@ export const RISKY_MISS_PENALTY = 500 // flat points lost if you bet Risky and m
 export const ALLIN_MIN_BUYIN = 1000 // minimum banked score required to bet All-In
 export const SWAP_MISS_PENALTY = 750 // flat points lost if you bet Swap and miss
 export const SWAP_MIN_BUYIN = 500 // minimum banked score required to bet Point Swap
+
+// --- Real or Cap mode ---
+export const RF_POINTS = 500 // flat points for a correct REAL/CAP vote (simple party math)
+
+// --- Survival mode ---
+export const SURVIVAL_LIVES = 3 // lives each player starts with
 
 export interface RoundScoring {
   deltas: Record<string, number> // total points awarded this round (base*bet + streak bonus, +/- penalties)
@@ -267,10 +278,66 @@ export function applyScoreDeltas(
   return afterDeltas.map((p) => ({ ...p, score: finalScores[p.id] ?? p.score }))
 }
 
+// ---- Real or Cap mode ----
+
+// Build this round's claim: pick one line from the conversation and, 50/50, attribute it to its
+// true speaker or to a random OTHER guessable speaker (the "cap"). Voters decide which it is.
+export function buildRfClaim(question: RoundQuestion, speakers: Speaker[]): RfClaim | null {
+  if (question.lines.length === 0 || speakers.length < 2) return null
+  const line = question.lines[Math.floor(Math.random() * question.lines.length)]
+  const trueSpeakerId = question.correctAnswers[line.lineId]
+  const isReal = Math.random() < 0.5
+  let claimedSpeakerId = trueSpeakerId
+  if (!isReal) {
+    const others = speakers.filter((s) => s.id !== trueSpeakerId)
+    if (others.length === 0) return null
+    claimedSpeakerId = others[Math.floor(Math.random() * others.length)].id
+  }
+  const claimedSpeakerName = speakers.find((s) => s.id === claimedSpeakerId)?.name ?? '???'
+  return { lineId: line.lineId, claimedSpeakerId, claimedSpeakerName, isReal }
+}
+
+// Flat scoring for a Real-or-Cap round: +RF_POINTS for a correct vote, 0 otherwise.
+// perfectRound doubles as "voted correctly" so the drinking overlay and UI reuse it.
+export function scoreRfRound(
+  claim: RfClaim,
+  votes: GameState['rfVotes'],
+  players: Player[]
+): Pick<RoundScoring, 'deltas' | 'perfectRound'> {
+  const deltas: Record<string, number> = {}
+  const perfectRound: Record<string, boolean> = {}
+  const truth: 'real' | 'fake' = claim.isReal ? 'real' : 'fake'
+  for (const p of players) {
+    const right = votes[p.id] === truth
+    perfectRound[p.id] = right
+    deltas[p.id] = right ? RF_POINTS : 0
+  }
+  return { deltas, perfectRound }
+}
+
+// ---- Survival mode ----
+
+export function aliveIds(lives: GameState['lives']): string[] {
+  return Object.entries(lives).filter(([, n]) => n > 0).map(([id]) => id)
+}
+
+// Imperfect round = lose a life (floor 0). Already-eliminated players are untouched.
+export function applyLifeLoss(
+  lives: GameState['lives'],
+  perfectRound: Record<string, boolean>
+): GameState['lives'] {
+  const next: GameState['lives'] = { ...lives }
+  for (const [id, n] of Object.entries(next)) {
+    if (n > 0 && !perfectRound[id]) next[id] = n - 1
+  }
+  return next
+}
+
 export function createInitialGameState(roomCode: string, totalRounds: number, speakers: Speaker[] = []): GameState {
   return {
     phase: 'lobby',
-    mode: 'normal',
+    mode: 'classic',
+    drinking: false,
     roomCode,
     speakers,
     players: [],
@@ -289,6 +356,9 @@ export function createInitialGameState(roomCode: string, totalRounds: number, sp
     bets: {},
     swapTargets: {},
     executedSwaps: [],
+    rfClaim: null,
+    rfVotes: {},
+    lives: {},
   }
 }
 
@@ -321,6 +391,12 @@ export function computeRoundDrinks(
   if (wrong === 0) return { kind: 'safe' }
   if (total >= 2 && wrong === total) return { kind: 'shot' } // whiffed a whole dialogue
   return { kind: 'sips', sips: wrong }
+}
+
+// Real-or-Cap drink penalty: wrong vote = a sip, no vote = AFK sips.
+export function computeRfDrink(vote: 'real' | 'fake' | undefined, correct: boolean): DrinkResult {
+  if (vote === undefined) return { kind: 'afk', sips: 2 }
+  return correct ? { kind: 'safe' } : { kind: 'sips', sips: 1 }
 }
 
 export function drinkResultText(r: DrinkResult): string {

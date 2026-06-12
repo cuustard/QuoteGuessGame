@@ -5,7 +5,7 @@ export function ContextBar({ context, happenedAt, small }: { context: string | n
   const ago = relativeTime(happenedAt)
   if (!context && !date) return null
   return (
-    <div className={`rounded-xl ${small ? 'p-3 text-sm' : 'p-4'} text-center italic`} style={{ background: 'var(--surface)', color: 'var(--muted)' }}>
+    <div className={`rounded-xl ${small ? 'p-4 text-xl' : 'p-5 text-2xl'} text-center italic`} style={{ background: 'var(--surface)', color: 'var(--muted)' }}>
       {date && (
         <span className="not-italic font-bold mr-2" style={{ color: 'var(--accent)' }}>
           {date}{ago && <span className="font-normal opacity-70"> ({ago})</span>}

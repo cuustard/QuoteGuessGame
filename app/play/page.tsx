@@ -7,6 +7,7 @@ import Link from 'next/link'
 import { useSearchParams } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
 import { computeRoundDrinks, drinkResultText, ALLIN_MIN_BUYIN, SWAP_MIN_BUYIN } from '@/lib/game'
+import { TYPE_SPEED_MS } from '@/app/host/components/Typewriter'
 import { unlockAudio, playCorrect, playWrong, playTick } from '@/lib/sounds'
 import { haptics } from '@/lib/haptics'
 import { burstConfetti } from '@/lib/confetti'
@@ -39,6 +40,8 @@ function PlayerController() {
   const [activeLineId, setActiveLineId] = useState<number | null>(null)
   const [error, setError] = useState('')
   const [promptCountdown, setPromptCountdown] = useState<number | null>(null)
+  const [promptTyped, setPromptTyped] = useState(0) // quote chars revealed so far, synced to the TV
+  const promptTypeRef = useRef<{ conv: number; start: number } | null>(null)
   const channelRef = useRef<RealtimeChannel | null>(null)
   const joinedRef = useRef(false)
   const lastPhaseRef = useRef<string | null>(null)
@@ -153,6 +156,29 @@ function PlayerController() {
     return () => clearInterval(iv)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gameState?.phase, gameState?.promptEnd])
+
+  // Type the quote onto the phone in lockstep with the host's TV typewriter. Anchored to the local
+  // moment this round's prompt arrived (not the host clock), so device clock-skew can't desync it.
+  // The host types the context first, then the quote — so we hold the quote for that same delay.
+  useEffect(() => {
+    const q = gameState?.phase === 'prompt' ? gameState.question : null
+    const conv = q?.conversationId
+    if (q && conv !== undefined && promptTypeRef.current?.conv !== conv) {
+      promptTypeRef.current = { conv, start: Date.now() }
+    }
+    const compute = () => {
+      if (!q || !promptTypeRef.current) return 0
+      const contextDelay = (q.context ? `📍 ${q.context}`.length : 0) * TYPE_SPEED_MS
+      const quoteLen = q.lines.reduce((a, l) => a + l.lineText.length, 0)
+      const elapsed = Date.now() - promptTypeRef.current.start - contextDelay
+      return Math.max(0, Math.min(quoteLen, Math.floor(elapsed / TYPE_SPEED_MS)))
+    }
+    setPromptTyped(compute())
+    if (!q) return
+    const iv = setInterval(() => setPromptTyped(compute()), 40)
+    return () => clearInterval(iv)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameState?.phase, gameState?.question?.conversationId])
 
   // Blind Confidence: the bet is chosen during the prompt phase and transmitted the instant
   // guessing opens — before any guess can end the round — so no one is mid-bet at round end.
@@ -377,6 +403,28 @@ function PlayerController() {
             </div>
           )}
 
+          {/* The quote, typed in sync with the host's TV typewriter so you can read + bet without looking up */}
+          {gameState.question && (
+            <div className="rounded-2xl p-4 space-y-2 min-h-[3.5rem]" style={{ background: 'var(--surface)' }}>
+              {gameState.question.lines.map((line, i) => {
+                const startOffset = gameState.question!.lines.slice(0, i).reduce((a, l) => a + l.lineText.length, 0)
+                if (promptTyped <= startOffset) return null
+                const visible = Math.min(line.lineText.length, promptTyped - startOffset)
+                const typing = promptTyped < startOffset + line.lineText.length
+                return (
+                  <div key={line.lineId} className="animate-slide-up">
+                    {line.actionText && <p className="text-xs italic mb-0.5" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
+                    <p className="leading-snug">
+                      <span className="font-black" style={{ color: 'var(--primary-light)' }}>???</span>{' '}
+                      &ldquo;{line.lineText.slice(0, visible)}&rdquo;{typing && <span className="cursor-blink">▋</span>}
+                    </p>
+                  </div>
+                )
+              })}
+              {promptTyped === 0 && <p className="leading-snug" style={{ color: 'var(--muted)' }}><span className="cursor-blink">▋</span></p>}
+            </div>
+          )}
+
           {/* Place your bet — NO BET is the safe default; the stakes are grouped below it */}
           <div className="rounded-2xl p-3 space-y-2" style={{ background: 'var(--surface)' }}>
             <p className="text-xs uppercase tracking-widest text-center" style={{ color: 'var(--muted)' }}>Place your bet</p>
@@ -486,7 +534,7 @@ function PlayerController() {
                 <span className="text-xs uppercase tracking-widest" style={{ color: 'var(--muted)' }}>guessing starts in</span>
               </div>
             )}
-            <p className="text-xs" style={{ color: 'var(--muted)' }}>📺 Read the quote on the host screen</p>
+            <p className="text-xs" style={{ color: 'var(--muted)' }}>Lock in a bet — guessing opens when the timer hits zero</p>
           </div>
         </div>
       )}

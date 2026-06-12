@@ -8,10 +8,11 @@ export function JoinQR({ roomCode }: { roomCode: string }) {
   useEffect(() => {
     const origin = typeof window !== 'undefined' ? window.location.origin : ''
     const url = `${origin}/?room=${roomCode}`
-    QRCode.toDataURL(url, { width: 200, margin: 1, color: { dark: '#1a1a2e', light: '#ffffff' } })
+    // Generate at high resolution so it stays crisp when shown large on a TV.
+    QRCode.toDataURL(url, { width: 600, margin: 1, color: { dark: '#1a1a2e', light: '#ffffff' } })
       .then(setDataUrl).catch(() => {})
   }, [roomCode])
   if (!dataUrl) return null
   // eslint-disable-next-line @next/next/no-img-element
-  return <img src={dataUrl} alt="Join QR code" width={180} height={180} className="rounded-xl" />
+  return <img src={dataUrl} alt="Join QR code" width={380} height={380} className="rounded-xl" />
 }

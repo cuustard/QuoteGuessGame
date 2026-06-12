@@ -15,8 +15,18 @@ export function TVScaleWrapper({ children }: { children: ReactNode }) {
   }, [])
 
   return (
-    <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#000', overflow: 'hidden' }}>
-      <div style={{ width: '1920px', height: '1080px', transform: `scale(${scale})`, transformOrigin: 'center center', overflow: 'hidden' }}>
+    <div className="fixed inset-0 bg-black overflow-hidden">
+      <div
+        style={{
+          position: 'absolute',
+          left: '50%',
+          top: '50%',
+          width: '1920px',
+          height: '1080px',
+          transform: `translate(-50%, -50%) scale(${scale})`,
+          transformOrigin: 'center center',
+        }}
+      >
         {children}
       </div>
     </div>

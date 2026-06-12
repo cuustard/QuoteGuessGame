@@ -90,18 +90,21 @@ export const TIMER_DURATION_MS = 20_000
 export const POINTS_MAX = 1000
 export const POINTS_MIN = 100
 
-export function calculateScore(correctLines: number, totalLines: number, elapsedMs: number): number {
+export function calculateScore(correctLines: number, totalLines: number, elapsedMs: number, timerDuration: number = TIMER_DURATION_MS): number {
   if (correctLines === 0) return 0
   const accuracy = correctLines / totalLines
-  const timeBonus = Math.max(0, 1 - elapsedMs / TIMER_DURATION_MS)
+  // Speed bonus scales to the actual round length the host configured (10s / 20s / 30s).
+  const timeBonus = Math.max(0, 1 - elapsedMs / timerDuration)
   const raw = POINTS_MIN + (POINTS_MAX - POINTS_MIN) * timeBonus
   return Math.round(raw * accuracy)
 }
 
 export const STREAK_BONUS_PER_LEVEL = 100 // extra points per consecutive perfect round
+export const NO_BET_MISS_PENALTY = 100 // flat points lost on NO BET if you miss a line (gives Safe its value)
 export const RISKY_MISS_PENALTY = 500 // flat points lost if you bet Risky and miss any line
-export const ALLIN_MIN_LOSS = 300 // floor for All-In loss so early-game all-ins still sting
+export const ALLIN_MIN_BUYIN = 1000 // minimum banked score required to bet All-In
 export const SWAP_MISS_PENALTY = 750 // flat points lost if you bet Swap and miss
+export const SWAP_MIN_BUYIN = 500 // minimum banked score required to bet Point Swap
 
 export interface RoundScoring {
   deltas: Record<string, number> // total points awarded this round (base*bet + streak bonus, +/- penalties)
@@ -117,6 +120,7 @@ export interface PlayerRoundScore {
   correct: number        // lines answered correctly
   total: number          // lines in the round
   perfect: boolean       // every line correct
+  base: number           // accuracy + speed scaled points, pre-bet (full base on a perfect round)
   earned: number         // points from the guess itself (base*bet, or a penalty), pre-streak
   streakBonus: number    // streak-bonus portion (0 unless perfect)
   delta: number          // exact total score change this round (earned + streakBonus)
@@ -130,40 +134,50 @@ export function scorePlayerRound(
   elapsedMs: number,
   bet: Bet,
   currentScore: number,
-  streak: number
+  streak: number,
+  timerDuration: number = TIMER_DURATION_MS
 ): PlayerRoundScore {
   const total = question.lines.length
   let correct = 0
   for (const line of question.lines) {
     if (getGuess(line.lineId) === question.correctAnswers[line.lineId]) correct++
   }
-  const base = calculateScore(correct, total, elapsedMs)
+  const base = calculateScore(correct, total, elapsedMs, timerDuration)
   const perfect = correct === total && total > 0
 
-  // Safe (0.5) / Normal (1): scale earnings, keep partial credit, never negative.
+  // Safe (0.5):  half the (partial-credit) base, never negative — the hedge.
+  // NO BET (1):  full base on a perfect round, else a flat -NO_BET_MISS_PENALTY (no partial credit).
   // High tiers are all-or-nothing on a PERFECT round:
   //   Risky (2):  +2x if perfect, else flat -RISKY_MISS_PENALTY (forfeits partial credit)
-  //   All-In (3): +3x if perfect, else lose HALF your banked total (min ALLIN_MIN_LOSS)
+  //   All-In (3): perfect DOUBLES the banked total; any miss wipes it to 0 (no streak bonus)
   //   Swap:       0 delta (swap handled separately), else flat -SWAP_MISS_PENALTY; no streak bonus
   let earned: number
   let swapFired = false
   if (bet === 'swap') {
     if (perfect) { earned = 0; swapFired = true }
     else earned = -SWAP_MISS_PENALTY
-  } else if (bet >= 2) {
-    if (perfect) earned = Math.round(base * bet)
-    else if (bet === 2) earned = -RISKY_MISS_PENALTY
-    else earned = -Math.max(Math.floor(currentScore / 2), ALLIN_MIN_LOSS)
+  } else if (bet === 2) {
+    // Risky: +2x on a perfect round, else a flat penalty (forfeits partial credit).
+    if (perfect) earned = Math.round(base * 2)
+    else earned = -RISKY_MISS_PENALTY
+  } else if (bet === 3) {
+    // All-In: true double-or-nothing on the banked total. Perfect → add the whole total
+    // again (doubles it); any miss → subtract it all (drops to 0).
+    earned = perfect ? currentScore : -currentScore
+  } else if (bet === 0.5) {
+    // Safe: half of the (partial-credit) base, never negative.
+    earned = Math.round(base * 0.5)
   } else {
-    earned = Math.round(base * bet)
+    // NO BET (1): full base on a perfect round, flat penalty on any miss (forfeits partial credit).
+    earned = perfect ? base : -NO_BET_MISS_PENALTY
   }
 
-  // Streak bonus: not awarded on swap bets (the swap is the reward).
-  const streakBonus = perfect && bet !== 'swap' ? streak * STREAK_BONUS_PER_LEVEL : 0
+  // Streak bonus: not awarded on swap or All-In (their reward is the swap / the doubling).
+  const streakBonus = perfect && bet !== 'swap' && bet !== 3 ? streak * STREAK_BONUS_PER_LEVEL : 0
   const delta = earned + streakBonus
   const perLine = correct > 0 && delta > 0 ? Math.round(delta / correct) : 0
 
-  return { correct, total, perfect, earned, streakBonus, delta, perLine, swapFired }
+  return { correct, total, perfect, base, earned, streakBonus, delta, perLine, swapFired }
 }
 
 export function scoreRound(
@@ -171,26 +185,35 @@ export function scoreRound(
   allGuesses: GameState['guesses'],
   players: Player[],
   timerStart: number,
+  timerDuration: number,
+  lockTimes: GameState['lockTimes'] = {},
   bets: GameState['bets'] = {},
   swapTargets: GameState['swapTargets'] = {}
 ): RoundScoring {
-  const elapsed = Date.now() - timerStart
   const deltas: Record<string, number> = {}
   const streakBonuses: Record<string, number> = {}
   const perfectRound: Record<string, boolean> = {}
   const executedSwaps: Array<{ winnerId: string; loserId: string }> = []
+  // A player can be in at most one swap per round — prevents the leader's score being
+  // duplicated to multiple attackers (which would inject points and break conservation).
+  const swapInvolved = new Set<string>()
 
   // Snapshot pre-round scores so swap amounts are deterministic regardless of delta order.
   const preRoundScores: Record<string, number> = Object.fromEntries(players.map((p) => [p.id, p.score]))
+  // Players who never locked in fall back to the full duration → minimum (floor) speed bonus.
+  const fallbackLock = timerStart + timerDuration
 
   for (const player of players) {
+    const lockedAt = lockTimes[player.id] ?? fallbackLock
+    const elapsed = Math.max(0, Math.min(timerDuration, lockedAt - timerStart))
     const r = scorePlayerRound(
       question,
       (lineId) => allGuesses[lineId]?.[player.id],
       elapsed,
       bets[player.id] ?? 1,
       player.score,
-      player.streak
+      player.streak,
+      timerDuration
     )
     perfectRound[player.id] = r.perfect
     streakBonuses[player.id] = r.streakBonus
@@ -199,12 +222,18 @@ export function scoreRound(
     if (r.swapFired) {
       const targetId = swapTargets[player.id]
       const target = targetId ? players.find((p) => p.id === targetId) : undefined
-      // Only execute if the target is still ahead (using pre-round scores)
-      if (target && preRoundScores[target.id] > preRoundScores[player.id]) {
-        executedSwaps.push({ winnerId: player.id, loserId: target.id })
+      const targetAhead = !!target && preRoundScores[target.id] > preRoundScores[player.id]
+      if (targetAhead && !swapInvolved.has(player.id) && !swapInvolved.has(target!.id)) {
+        swapInvolved.add(player.id)
+        swapInvolved.add(target!.id)
+        executedSwaps.push({ winnerId: player.id, loserId: target!.id })
+      } else if (targetAhead) {
+        // Target valid, but this player or the target is already in a swap this round —
+        // this swap can't fire. The perfect swapper falls back to standard base points
+        // (no swap, no streak bonus, no penalty).
+        deltas[player.id] = r.base
       }
-      // If target is no longer ahead or wasn't set, the swap silently misses —
-      // no penalty (player already staked the round on being correct).
+      // else: target not ahead / unset → silent miss, delta stays 0 (no penalty).
     }
   }
 
@@ -249,6 +278,7 @@ export function createInitialGameState(roomCode: string, totalRounds: number, sp
     totalRounds,
     question: null,
     guesses: {},
+    lockTimes: {},
     timerStart: null,
     timerDuration: TIMER_DURATION_MS,
     promptEnd: null,

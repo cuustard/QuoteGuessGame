@@ -66,6 +66,8 @@ export interface GameState {
   question: RoundQuestion | null
   // lineId -> { playerId -> speakerId }
   guesses: Record<number, Record<string, number>>
+  // playerId -> epoch ms when they finished answering every line (drives the individual speed bonus)
+  lockTimes: Record<string, number>
   timerStart: number | null // epoch ms
   timerDuration: number // ms — configurable by host in lobby
   promptEnd: number | null // epoch ms when prompt phase ends and guessing begins

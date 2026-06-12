@@ -20,10 +20,14 @@ import { Podium } from './components/Podium'
 import { JoinQR } from './components/JoinQR'
 import { LiveLeaderboard } from './components/LiveLeaderboard'
 import { TimerBar } from './components/TimerBar'
+import { TVScaleWrapper } from './components/TVScaleWrapper'
 
 const ROUND_OPTIONS = [5, 10, 15, 20]
 const TIMER_OPTIONS_SEC = [10, 20, 30]
-const PROMPT_BUFFER_MS = 6600 // 1600ms typing finish + 5000ms reading pause
+// Extra time after the quote finishes typing: read it, decide, and place a bet before guessing.
+const PROMPT_BUFFER_MS = 1600 + 11000 // 1600ms typing finish + 11s read/think/bet pause
+const PROMPT_MIN_MS = 14000
+const PROMPT_MAX_MS = 32000
 const REVEAL_STEP_MS = 900
 const STORAGE_KEY = 'wsi_host_game'
 
@@ -118,7 +122,7 @@ export default function HostPage() {
         speakerName: cur.speakers.find((s) => s.id === revealedAnswers[l.lineId])?.name ?? '???',
       })),
     }
-    const { deltas, streakBonuses, perfectRound, executedSwaps } = scoreRound(cur.question, cur.guesses, cur.players, cur.timerStart ?? Date.now(), cur.bets, cur.swapTargets)
+    const { deltas, streakBonuses, perfectRound, executedSwaps } = scoreRound(cur.question, cur.guesses, cur.players, cur.timerStart ?? Date.now(), cur.timerDuration, cur.lockTimes, cur.bets, cur.swapTargets)
     const updatedPlayers = applyScoreDeltas(cur.players, deltas, perfectRound, executedSwaps)
     broadcast({
       ...cur, phase: 'reveal', revealedAnswers, question: questionWithNames,
@@ -193,10 +197,17 @@ export default function HostPage() {
       const cur0 = stateRef.current
       if (cur0?.phase !== 'guessing') return
       if (!cur0.players.find((p) => p.id === payload.playerId)) return
-      const next = commitState((cur) => ({
-        ...cur,
-        guesses: { ...cur.guesses, [payload.lineId]: { ...(cur.guesses[payload.lineId] ?? {}), [payload.playerId]: payload.speakerId } },
-      }))
+      const now = Date.now() // event-time, captured outside the render-pure updater
+      const next = commitState((cur) => {
+        const guesses = { ...cur.guesses, [payload.lineId]: { ...(cur.guesses[payload.lineId] ?? {}), [payload.playerId]: payload.speakerId } }
+        // Stamp this player's individual lock-in time the first moment they've answered every line.
+        const lineIds = cur.question?.lines.map((l) => l.lineId) ?? []
+        const done = lineIds.length > 0 && lineIds.every((lid) => guesses[lid]?.[payload.playerId] !== undefined)
+        const lockTimes = done && cur.lockTimes[payload.playerId] === undefined
+          ? { ...cur.lockTimes, [payload.playerId]: now }
+          : cur.lockTimes
+        return { ...cur, guesses, lockTimes }
+      })
       checkAllGuessed(next)
     })
 
@@ -204,7 +215,14 @@ export default function HostPage() {
       if (payload.type !== 'lock_in') return
       const cur = stateRef.current
       if (!cur || cur.phase !== 'guessing') return
-      checkAllGuessed(cur)
+      if (!cur.players.find((p) => p.id === payload.playerId)) return
+      // Stamp lock-in time for a player who locks in before answering every line
+      // (the all-answered path stamps it in submit_guess; whichever fires first wins).
+      if (cur.lockTimes[payload.playerId] === undefined) {
+        const now = Date.now()
+        commitState((c) => ({ ...c, lockTimes: { ...c.lockTimes, [payload.playerId]: now } }))
+      }
+      checkAllGuessed(stateRef.current!)
     })
 
     // Presence: players track() themselves keyed by playerId; sync tells us who's live.
@@ -292,13 +310,15 @@ export default function HostPage() {
     const question = buildRoundQuestion(conv)
     const contextChars = question.context?.length ?? 0
     const quoteChars = question.lines.reduce((a, l) => a + l.lineText.length, 0)
-    const promptMs = Math.min(20000, Math.max(8000, (contextChars + quoteChars) * TYPE_SPEED_MS + PROMPT_BUFFER_MS))
+    const promptMs = Math.min(PROMPT_MAX_MS, Math.max(PROMPT_MIN_MS, (contextChars + quoteChars) * TYPE_SPEED_MS + PROMPT_BUFFER_MS))
+    // eslint-disable-next-line react-hooks/purity -- event-driven, not a render path
+    const promptEnd = Date.now() + promptMs
     const nextState: GameState = {
       ...cur,
       phase: 'prompt',
       currentRound: advance ? cur.currentRound + 1 : cur.currentRound,
-      promptEnd: Date.now() + promptMs,
-      question, guesses: {}, timerStart: null, revealedAnswers: {}, scores: {}, streakBonuses: {}, perfectRound: {}, bets: {}, swapTargets: {}, executedSwaps: [],
+      promptEnd,
+      question, guesses: {}, lockTimes: {}, timerStart: null, revealedAnswers: {}, scores: {}, streakBonuses: {}, perfectRound: {}, bets: {}, swapTargets: {}, executedSwaps: [],
     }
     setTimeLeft(nextState.timerDuration)
     broadcast(nextState)
@@ -308,6 +328,7 @@ export default function HostPage() {
   // Fires when the pre-calculated promptEnd timestamp is reached.
   function beginPromptCountdown() {
     if (promptRef.current) clearTimeout(promptRef.current)
+    // eslint-disable-next-line react-hooks/purity -- event-driven, not a render path
     const remaining = Math.max(0, (stateRef.current?.promptEnd ?? 0) - Date.now())
     promptRef.current = setTimeout(() => {
       const cur = stateRef.current
@@ -381,11 +402,14 @@ export default function HostPage() {
   }, [state?.phase, state?.question?.conversationId])
 
   useEffect(() => {
-    if (state?.phase !== 'prompt' || !state.promptEnd) { setPromptCountdown(null); return }
-    const tick = () => setPromptCountdown(Math.max(0, Math.ceil((state.promptEnd! - Date.now()) / 1000)))
-    tick()
-    const iv = setInterval(tick, 250)
+    const active = state?.phase === 'prompt' && !!state.promptEnd
+    const secsLeft = () => Math.max(0, Math.ceil((state!.promptEnd! - Date.now()) / 1000))
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPromptCountdown(active ? secsLeft() : null)
+    if (!active) return
+    const iv = setInterval(() => setPromptCountdown(secsLeft()), 250)
     return () => clearInterval(iv)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state?.phase, state?.promptEnd])
 
   useEffect(() => () => {
@@ -397,7 +421,8 @@ export default function HostPage() {
   // ---------- Landing ----------
   if (!state) {
     return (
-      <main className="flex min-h-dvh items-center justify-center flex-col gap-8">
+      <TVScaleWrapper>
+      <main className="flex min-h-dvh items-center justify-center flex-col gap-8" style={{ width: '1920px', height: '1080px' }}>
         <div className="text-center space-y-4">
           <div className="text-8xl">🎤</div>
           <h1 className="text-5xl font-black" style={{ color: 'var(--primary-light)' }}>Who Said It?</h1>
@@ -416,13 +441,15 @@ export default function HostPage() {
           </button>
         )}
       </main>
+      </TVScaleWrapper>
     )
   }
 
   const showSidebar = (state.phase === 'prompt' || state.phase === 'guessing' || state.phase === 'reveal') && state.players.length > 0
 
   return (
-    <main className="min-h-dvh p-4 sm:p-6 flex flex-col gap-6">
+    <TVScaleWrapper>
+    <main className="p-8 flex flex-col gap-6" style={{ width: '1920px', height: '1080px', overflow: 'hidden' }}>
       {/* Header */}
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <div className="text-xl sm:text-2xl font-black flex items-center gap-2" style={{ color: 'var(--primary-light)' }}>
@@ -769,5 +796,6 @@ export default function HostPage() {
       {/* Floating reactions overlay */}
       <ReactionsOverlay reactions={reactions} />
     </main>
+    </TVScaleWrapper>
   )
 }

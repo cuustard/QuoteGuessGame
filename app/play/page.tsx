@@ -6,7 +6,7 @@ import { useEffect, useRef, useState, Suspense } from 'react'
 import Link from 'next/link'
 import { useSearchParams } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
-import { computeRoundDrinks, drinkResultText } from '@/lib/game'
+import { computeRoundDrinks, drinkResultText, ALLIN_MIN_BUYIN, SWAP_MIN_BUYIN } from '@/lib/game'
 import { unlockAudio, playCorrect, playWrong, playTick } from '@/lib/sounds'
 import { haptics } from '@/lib/haptics'
 import { burstConfetti } from '@/lib/confetti'
@@ -44,6 +44,8 @@ function PlayerController() {
   const lastPhaseRef = useRef<string | null>(null)
   const sessionSavedRef = useRef(false)
   const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const betSentRef = useRef(false)                  // bet transmitted once when guessing opens
+  const roundResetRef = useRef<number | null>(null) // conversationId we've already reset local state for
 
   useEffect(() => {
     if (!roomCode || !playerName) return
@@ -66,13 +68,17 @@ function PlayerController() {
         sessionSavedRef.current = true
         savePlayerSession({ room: roomCode, name: playerName, avatar, id: playerId })
       }
-      // Reset guesses, lock, bet & active line for new round
-      if (payload.state.phase === 'prompt' || payload.state.phase === 'lobby') {
-        setMyGuesses({})
-        setLockedIn(false)
-        setBetState(1)
-        setSwapTargetState(null)
-        setActiveLineId(null)
+      // Reset local round state ONCE per question. Doing it on every prompt re-broadcast would
+      // wipe a bet the player already placed when, e.g., another player joins mid-prompt.
+      const convId = payload.state.question?.conversationId ?? null
+      if (payload.state.phase === 'lobby') {
+        setMyGuesses({}); setLockedIn(false); setBetState(1); setSwapTargetState(null); setActiveLineId(null)
+        roundResetRef.current = null
+        betSentRef.current = false
+      } else if (payload.state.phase === 'prompt' && convId !== null && roundResetRef.current !== convId) {
+        roundResetRef.current = convId
+        betSentRef.current = false
+        setMyGuesses({}); setLockedIn(false); setBetState(1); setSwapTargetState(null); setActiveLineId(null)
       }
     })
 
@@ -138,12 +144,29 @@ function PlayerController() {
   }, [gameState, myGuesses])
 
   useEffect(() => {
-    if (gameState?.phase !== 'prompt' || !gameState.promptEnd) { setPromptCountdown(null); return }
-    const tick = () => setPromptCountdown(Math.max(0, Math.ceil((gameState.promptEnd! - Date.now()) / 1000)))
-    tick()
-    const iv = setInterval(tick, 250)
+    const active = gameState?.phase === 'prompt' && !!gameState.promptEnd
+    const secsLeft = () => Math.max(0, Math.ceil((gameState!.promptEnd! - Date.now()) / 1000))
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPromptCountdown(active ? secsLeft() : null)
+    if (!active) return
+    const iv = setInterval(() => setPromptCountdown(secsLeft()), 250)
     return () => clearInterval(iv)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gameState?.phase, gameState?.promptEnd])
+
+  // Blind Confidence: the bet is chosen during the prompt phase and transmitted the instant
+  // guessing opens — before any guess can end the round — so no one is mid-bet at round end.
+  useEffect(() => {
+    if (gameState?.phase !== 'guessing' || betSentRef.current) return
+    betSentRef.current = true
+    const ch = channelRef.current
+    if (!ch) return
+    ch.send({ type: 'broadcast', event: 'set_bet', payload: { type: 'set_bet', playerId, bet } satisfies ChannelMessage })
+    if (bet === 'swap' && swapTarget) {
+      ch.send({ type: 'broadcast', event: 'set_swap_target', payload: { type: 'set_swap_target', playerId, targetId: swapTarget } satisfies ChannelMessage })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameState?.phase])
 
   // Stop the pulse / pending payoff if the player navigates away mid-reveal.
   useEffect(() => () => {
@@ -170,26 +193,23 @@ function PlayerController() {
     })
   }
 
-  async function chooseBet(b: Bet) {
-    if (lockedIn || !gameState || gameState.phase !== 'guessing') return
+  // Bet selection happens during the prompt phase and is stored locally only — the host rejects
+  // set_bet outside the guessing phase, so it's transmitted later by the guessing-start effect.
+  function chooseBet(b: Bet) {
+    if (gameState?.phase !== 'prompt') return
+    if (b === 3 && myScore < ALLIN_MIN_BUYIN) return // All-In requires the buy-in
+    if (b === 'swap' && myScore < SWAP_MIN_BUYIN) return // Point Swap requires the buy-in
     haptics.tap()
     setBetState(b)
-    await channelRef.current?.send({
-      type: 'broadcast',
-      event: 'set_bet',
-      payload: { type: 'set_bet', playerId, bet: b } satisfies ChannelMessage,
-    })
+    // Default the swap target to the top player so picking 'swap' is never a silent miss.
+    if (b === 'swap') { if (!swapTarget && swapTargets.length > 0) setSwapTargetState(swapTargets[0].id) }
+    else setSwapTargetState(null)
   }
 
-  async function chooseSwapTarget(targetId: string) {
-    if (lockedIn || !gameState || gameState.phase !== 'guessing') return
+  function chooseSwapTarget(targetId: string) {
+    if (gameState?.phase !== 'prompt') return
     haptics.tap()
     setSwapTargetState(targetId)
-    await channelRef.current?.send({
-      type: 'broadcast',
-      event: 'set_swap_target',
-      payload: { type: 'set_swap_target', playerId, targetId } satisfies ChannelMessage,
-    })
   }
 
   async function sendReaction(emoji: string) {
@@ -205,6 +225,19 @@ function PlayerController() {
     if (lockedIn) return
     haptics.lockIn()
     setLockedIn(true)
+    // Re-assert the bet first (a dropped set_bet must not cost the player), then lock + re-send guesses.
+    await channelRef.current?.send({
+      type: 'broadcast',
+      event: 'set_bet',
+      payload: { type: 'set_bet', playerId, bet } satisfies ChannelMessage,
+    })
+    if (bet === 'swap' && swapTarget) {
+      await channelRef.current?.send({
+        type: 'broadcast',
+        event: 'set_swap_target',
+        payload: { type: 'set_swap_target', playerId, targetId: swapTarget } satisfies ChannelMessage,
+      })
+    }
     await channelRef.current?.send({
       type: 'broadcast',
       event: 'lock_in',
@@ -272,6 +305,9 @@ function PlayerController() {
     .filter((p) => p.id !== playerId && p.score > myScore)
     .sort((a, b) => b.score - a.score)
 
+  // Read-only label for the bet locked in during the prompt phase.
+  const betLabel = bet === 'swap' ? '🔀 Point Swap' : bet === 3 ? '💀 All-In' : bet === 2 ? '🔥 Risky ×2' : bet === 0.5 ? '🛡 Safe ×0.5' : '😐 No bet'
+
   // Guessing-phase derived values (single shared grid targets the active line)
   const gLines = gameState.question?.lines ?? []
   const gMulti = gLines.length > 1
@@ -327,28 +363,130 @@ function PlayerController() {
         </div>
       )}
 
-      {/* Prompt — context + get-ready countdown (read the quote on the host screen) */}
+      {/* Prompt — place your bet now (Blind Confidence), read the quote on the host screen */}
       {gameState.phase === 'prompt' && (
-        <div className="flex-1 flex flex-col items-center justify-center gap-5 animate-slide-up">
-          <div className="text-5xl animate-bounce">👀</div>
-          <h2 className="text-2xl font-black text-center">Round {gameState.currentRound}</h2>
+        <div className="flex-1 flex flex-col gap-4 animate-slide-up">
+          <div className="text-center">
+            <div className="text-4xl animate-bounce">👀</div>
+            <h2 className="text-2xl font-black mt-1">Round {gameState.currentRound}</h2>
+          </div>
           {gameState.question?.context && (
-            <div className="rounded-xl p-4 text-center italic text-sm w-full"
+            <div className="rounded-xl p-3 text-center italic text-sm w-full"
               style={{ background: 'var(--surface)', color: 'var(--muted)' }}>
               📍 {gameState.question.context}
             </div>
           )}
-          <p className="text-sm" style={{ color: 'var(--muted)' }}>Reading the quote… look at the host screen.</p>
-          {promptCountdown !== null && promptCountdown > 0 && (
-            <div className="flex flex-col items-center gap-1">
-              <span className="text-5xl font-black tabular-nums" style={{ color: 'var(--accent)' }}>{promptCountdown}</span>
-              <span className="text-xs uppercase tracking-widest" style={{ color: 'var(--muted)' }}>guessing starts in</span>
+
+          {/* Place your bet — NO BET is the safe default; the stakes are grouped below it */}
+          <div className="rounded-2xl p-3 space-y-2" style={{ background: 'var(--surface)' }}>
+            <p className="text-xs uppercase tracking-widest text-center" style={{ color: 'var(--muted)' }}>Place your bet</p>
+
+            {/* Default — no bet, neutral */}
+            <button onClick={() => chooseBet(1)}
+              className="w-full rounded-xl py-3 px-2 font-bold leading-tight transition-all active:scale-95"
+              style={{
+                background: bet === 1 ? 'var(--primary)' : 'rgba(255,255,255,0.07)',
+                color: bet === 1 ? '#fff' : 'var(--text)',
+                border: bet === 1 ? '2px solid var(--primary-light)' : '2px solid transparent',
+              }}>
+              😐 NO BET
+              <span className="block text-[10px] font-normal opacity-80 mt-0.5">Full points if perfect — but <b>−100</b> if you miss a line</span>
+            </button>
+
+            {/* Separator */}
+            <div className="flex items-center gap-2 py-0.5">
+              <div className="flex-1 h-px" style={{ background: 'rgba(255,255,255,0.1)' }} />
+              <span className="text-[10px] uppercase tracking-widest" style={{ color: 'var(--muted)' }}>or take a risk</span>
+              <div className="flex-1 h-px" style={{ background: 'rgba(255,255,255,0.1)' }} />
+            </div>
+
+            {/* Stake bets */}
+            <div className="grid grid-cols-2 gap-2">
+              <button onClick={() => chooseBet(0.5)}
+                className="rounded-xl py-2.5 px-1 text-sm font-bold leading-tight transition-all active:scale-95"
+                style={{
+                  background: bet === 0.5 ? 'var(--correct)' : 'rgba(255,255,255,0.07)',
+                  color: bet === 0.5 ? '#fff' : 'var(--muted)',
+                  border: '2px solid transparent',
+                }}>
+                🛡 Safe ×0.5
+              </button>
+              <button onClick={() => chooseBet(2)}
+                className="rounded-xl py-2.5 px-1 text-sm font-bold leading-tight transition-all active:scale-95"
+                style={{
+                  background: bet === 2 ? 'var(--incorrect)' : 'rgba(255,255,255,0.07)',
+                  color: bet === 2 ? '#fff' : 'var(--muted)',
+                  border: '2px solid transparent',
+                }}>
+                🔥 Risky ×2
+              </button>
+              {/* All-In — locked until the player banks the buy-in */}
+              <button onClick={() => chooseBet(3)} disabled={myScore < ALLIN_MIN_BUYIN}
+                className="col-span-2 rounded-xl py-2.5 px-1 text-sm font-bold leading-tight transition-all active:scale-95"
+                style={{
+                  background: bet === 3 ? '#b91c1c' : 'rgba(255,255,255,0.07)',
+                  color: myScore < ALLIN_MIN_BUYIN ? 'var(--muted)' : bet === 3 ? '#fff' : 'var(--text)',
+                  border: bet === 3 ? '2px solid var(--incorrect)' : '2px solid transparent',
+                  opacity: myScore < ALLIN_MIN_BUYIN ? 0.45 : 1,
+                  cursor: myScore < ALLIN_MIN_BUYIN ? 'not-allowed' : 'pointer',
+                }}>
+                💀 All-In — Double or Nothing
+                {myScore < ALLIN_MIN_BUYIN && <span className="block text-[10px] font-normal mt-0.5">(Requires 1,000 pts)</span>}
+              </button>
+              {/* Point Swap — only shown when someone is ahead; locked until the buy-in is banked */}
+              {swapTargets.length > 0 && (
+                <button onClick={() => chooseBet('swap')} disabled={myScore < SWAP_MIN_BUYIN}
+                  className="col-span-2 rounded-xl py-2.5 px-1 text-sm font-bold leading-tight transition-all active:scale-95"
+                  style={{
+                    background: bet === 'swap' ? 'var(--accent)' : 'rgba(255,255,255,0.07)',
+                    color: myScore < SWAP_MIN_BUYIN ? 'var(--muted)' : bet === 'swap' ? '#000' : 'var(--text)',
+                    border: bet === 'swap' ? '2px solid var(--accent)' : '2px solid transparent',
+                    opacity: myScore < SWAP_MIN_BUYIN ? 0.45 : 1,
+                    cursor: myScore < SWAP_MIN_BUYIN ? 'not-allowed' : 'pointer',
+                  }}>
+                  🔀 Point Swap
+                  {myScore < SWAP_MIN_BUYIN && <span className="block text-[10px] font-normal mt-0.5">(Requires 500 pts)</span>}
+                </button>
+              )}
+            </div>
+
+            {/* Selected-bet explainer */}
+            {bet === 0.5 && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Half the points you earn — but <b>zero risk</b>. A safe hedge.</p>}
+            {bet === 2 && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Need a <b>perfect</b> round to win ×2 — miss any line and you lose <b style={{ color: 'var(--incorrect)' }}>500</b>.</p>}
+            {bet === 3 && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Perfect round = <b style={{ color: 'var(--correct)' }}>DOUBLE your total score</b>. Miss any line = <b style={{ color: 'var(--incorrect)' }}>lose EVERYTHING</b>. 💀</p>}
+            {bet === 'swap' && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Perfect round = steal their score. Miss and you lose <b style={{ color: 'var(--incorrect)' }}>750 pts</b>.</p>}
+          </div>
+
+          {/* Swap target picker */}
+          {bet === 'swap' && (
+            <div className="rounded-2xl p-3" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
+              <p className="text-xs uppercase tracking-widest text-center mb-2 font-black" style={{ color: 'var(--accent)' }}>Who do you want to swap with?</p>
+              <div className="flex flex-col gap-2">
+                {swapTargets.map((t) => (
+                  <button key={t.id} onClick={() => chooseSwapTarget(t.id)}
+                    className="flex items-center justify-between rounded-xl px-3 py-2.5 font-bold transition-all active:scale-95"
+                    style={{
+                      background: swapTarget === t.id ? 'var(--accent)' : 'rgba(255,255,255,0.07)',
+                      color: swapTarget === t.id ? '#000' : 'var(--text)',
+                      border: swapTarget === t.id ? '2px solid var(--accent)' : '2px solid transparent',
+                    }}>
+                    <span>{t.avatar} {t.name}</span>
+                    <span className="font-black tabular-nums">{t.score} pts</span>
+                  </button>
+                ))}
+              </div>
             </div>
           )}
-          <div className="flex gap-2">
-            <span className="w-3 h-3 rounded-full animate-bounce" style={{ background: 'var(--accent)', animationDelay: '0ms' }} />
-            <span className="w-3 h-3 rounded-full animate-bounce" style={{ background: 'var(--accent)', animationDelay: '150ms' }} />
-            <span className="w-3 h-3 rounded-full animate-bounce" style={{ background: 'var(--accent)', animationDelay: '300ms' }} />
+
+          {/* Countdown + reading hint */}
+          <div className="mt-auto flex flex-col items-center gap-2 pt-2">
+            {promptCountdown !== null && promptCountdown > 0 && (
+              <div className="flex flex-col items-center gap-0.5">
+                <span className="text-4xl font-black tabular-nums" style={{ color: 'var(--accent)' }}>{promptCountdown}</span>
+                <span className="text-xs uppercase tracking-widest" style={{ color: 'var(--muted)' }}>guessing starts in</span>
+              </div>
+            )}
+            <p className="text-xs" style={{ color: 'var(--muted)' }}>📺 Read the quote on the host screen</p>
           </div>
         </div>
       )}
@@ -411,64 +549,14 @@ function PlayerController() {
                 })}
               </div>
 
-              {/* Confidence bet */}
-              <div className="rounded-2xl p-3" style={{ background: 'var(--surface)' }}>
-                <p className="text-xs uppercase tracking-widest text-center mb-2" style={{ color: 'var(--muted)' }}>Confidence bet</p>
-                <div className="grid grid-cols-2 gap-2">
-                  {([0.5, 1, 2, 3] as const).map((b) => {
-                    const labels = { 0.5: '🛡 Safe ×0.5', 1: '😐 Normal', 2: '🔥 Risky ×2', 3: '💀 All-In ×3' } as const
-                    const activeBg = { 0.5: 'var(--correct)', 1: 'var(--primary)', 2: 'var(--incorrect)', 3: '#b91c1c' } as const
-                    const active = bet === b
-                    return (
-                      <button key={b} onClick={() => chooseBet(b)}
-                        className="rounded-xl py-2.5 px-1 text-sm font-bold leading-tight transition-all active:scale-95"
-                        style={{
-                          background: active ? activeBg[b] : 'rgba(255,255,255,0.07)',
-                          color: active ? '#fff' : 'var(--muted)',
-                          border: active && b === 3 ? '2px solid var(--incorrect)' : '2px solid transparent',
-                        }}>
-                        {labels[b]}
-                      </button>
-                    )
-                  })}
-                  {/* Point Swap — only shown when someone is ahead */}
-                  {swapTargets.length > 0 && (
-                    <button onClick={() => chooseBet('swap')}
-                      className="col-span-2 rounded-xl py-2.5 px-1 text-sm font-bold leading-tight transition-all active:scale-95"
-                      style={{
-                        background: bet === 'swap' ? 'var(--accent)' : 'rgba(255,255,255,0.07)',
-                        color: bet === 'swap' ? '#000' : 'var(--muted)',
-                        border: bet === 'swap' ? '2px solid var(--accent)' : '2px solid transparent',
-                      }}>
-                      🔀 Point Swap
-                    </button>
-                  )}
-                </div>
-                {bet === 2 && <p className="text-[11px] text-center mt-2" style={{ color: 'var(--muted)' }}>Need a <b>perfect</b> round to win ×2 — miss any line and you lose <b style={{ color: 'var(--incorrect)' }}>500</b>.</p>}
-                {bet === 3 && <p className="text-[11px] text-center mt-2" style={{ color: 'var(--muted)' }}>Perfect round = ×3. Miss and you lose <b style={{ color: 'var(--incorrect)' }}>half your total score</b>. 😬</p>}
-                {bet === 'swap' && <p className="text-[11px] text-center mt-2" style={{ color: 'var(--muted)' }}>Perfect round = steal their score. Miss and you lose <b style={{ color: 'var(--incorrect)' }}>750 pts</b>.</p>}
+              {/* Bet locked during prompt (Blind Confidence) — read-only reminder */}
+              <div className="rounded-xl px-3 py-2 flex items-center justify-center gap-2 text-xs" style={{ background: 'var(--surface)' }}>
+                <span style={{ color: 'var(--muted)' }}>Bet locked:</span>
+                <span className="font-bold" style={{ color: 'var(--text)' }}>{betLabel}</span>
+                {bet === 'swap' && swapTarget && (
+                  <span className="font-bold" style={{ color: 'var(--accent)' }}>→ {gameState.players.find((p) => p.id === swapTarget)?.name}</span>
+                )}
               </div>
-
-              {/* Swap target picker */}
-              {bet === 'swap' && (
-                <div className="rounded-2xl p-3" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
-                  <p className="text-xs uppercase tracking-widest text-center mb-2 font-black" style={{ color: 'var(--accent)' }}>Who do you want to swap with?</p>
-                  <div className="flex flex-col gap-2">
-                    {swapTargets.map((t) => (
-                      <button key={t.id} onClick={() => chooseSwapTarget(t.id)}
-                        className="flex items-center justify-between rounded-xl px-3 py-2.5 font-bold transition-all active:scale-95"
-                        style={{
-                          background: swapTarget === t.id ? 'var(--accent)' : 'rgba(255,255,255,0.07)',
-                          color: swapTarget === t.id ? '#000' : 'var(--text)',
-                          border: swapTarget === t.id ? '2px solid var(--accent)' : '2px solid transparent',
-                        }}>
-                        <span>{t.avatar} {t.name}</span>
-                        <span className="font-black tabular-nums">{t.score} pts</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
 
               {/* Lock in */}
               {gAssignedCount > 0 && (
@@ -556,7 +644,7 @@ function PlayerController() {
                 <>
                   <p className="text-4xl font-black">{myScore}</p>
                   <p className="text-sm mt-1 font-bold" style={{ color: delta >= 0 ? 'var(--correct)' : 'var(--incorrect)' }}>
-                    {delta >= 0 ? '+' : ''}{delta} this round{usedBet !== 1 && usedBet !== 'swap' && <span style={{ color: 'var(--muted)' }}> · ×{usedBet} bet</span>}
+                    {delta >= 0 ? '+' : ''}{delta} this round{(usedBet === 0.5 || usedBet === 2) && <span style={{ color: 'var(--muted)' }}> · ×{usedBet} bet</span>}{usedBet === 3 && <span style={{ color: 'var(--muted)' }}> · all-in</span>}
                   </p>
                 </>
               )

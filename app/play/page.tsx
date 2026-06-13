@@ -44,7 +44,7 @@ function PlayerController() {
   const [promptTyped, setPromptTyped] = useState(0) // quote chars revealed so far, synced to the TV
   const promptTypeRef = useRef<{ conv: number; start: number } | null>(null)
   const channelRef = useRef<RealtimeChannel | null>(null)
-  const joinedRef = useRef(false)
+  const connectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastPhaseRef = useRef<string | null>(null)
   const sessionSavedRef = useRef(false)
   const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -54,71 +54,89 @@ function PlayerController() {
   useEffect(() => {
     if (!roomCode || !playerName) return
     unlockAudio()
-    const channel = supabase.channel(`room:${roomCode}`, { config: { presence: { key: playerId } } })
+    let disposed = false
 
-    // The state_update handler clears this; if it fires, no host answered in time.
-    // (Don't read gameState here — this closure only ever sees the initial null.)
-    const connectTimeout = setTimeout(() => {
-      setError(`No game found for room ${roomCode}. Double-check the code with your host.`)
-    }, CONNECT_TIMEOUT_MS)
+    const clearConnectTimer = () => {
+      if (connectTimeoutRef.current) { clearTimeout(connectTimeoutRef.current); connectTimeoutRef.current = null }
+    }
 
-    channel.on('broadcast', { event: 'state_update' }, ({ payload }: { payload: ChannelMessage }) => {
-      if (payload.type !== 'state_update') return
-      clearTimeout(connectTimeout)
-      setError('')
-      setGameState(payload.state)
-      // Remember this session (once the room confirms it's live) for reconnects.
-      if (!sessionSavedRef.current) {
-        sessionSavedRef.current = true
-        savePlayerSession({ room: roomCode, name: playerName, avatar, id: playerId })
-      }
-      // Reset local round state ONCE per question. Doing it on every prompt re-broadcast would
-      // wipe a bet the player already placed when, e.g., another player joins mid-prompt.
-      const convId = payload.state.question?.conversationId ?? null
-      if (payload.state.phase === 'lobby') {
-        setMyGuesses({}); setLockedIn(false); setBetState(1); setSwapTargetState(null); setActiveLineId(null); setRfVote(null)
-        roundResetRef.current = null
-        betSentRef.current = false
-      } else if (payload.state.phase === 'prompt' && convId !== null && roundResetRef.current !== convId) {
-        roundResetRef.current = convId
-        betSentRef.current = false
-        setMyGuesses({}); setLockedIn(false); setBetState(1); setSwapTargetState(null); setActiveLineId(null); setRfVote(null)
-      }
-    })
+    const connect = () => {
+      // Tear down any previous channel so reconnects don't pile up duplicates.
+      if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null }
+      clearConnectTimer()
+      // If no state arrives in time, the room is genuinely unreachable (wrong/closed code).
+      connectTimeoutRef.current = setTimeout(() => {
+        if (!disposed) setError(`No game found for room ${roomCode}. Double-check the code with your host.`)
+      }, CONNECT_TIMEOUT_MS)
 
-    channel.on('broadcast', { event: 'speakers_sync' }, ({ payload }: { payload: ChannelMessage }) => {
-      if (payload.type !== 'speakers_sync') return
-      setSpeakers(payload.speakers)
-    })
+      const channel = supabase.channel(`room:${roomCode}`, { config: { presence: { key: playerId } } })
 
-    channel.on('broadcast', { event: 'join_rejected' }, ({ payload }: { payload: ChannelMessage }) => {
-      if (payload.type !== 'join_rejected' || payload.playerId !== playerId) return
-      clearTimeout(connectTimeout)
-      setError(payload.reason)
-    })
+      channel.on('broadcast', { event: 'state_update' }, ({ payload }: { payload: ChannelMessage }) => {
+        if (payload.type !== 'state_update') return
+        clearConnectTimer()
+        setError('')
+        setGameState(payload.state)
+        // Remember this session (once the room confirms it's live) for reconnects.
+        if (!sessionSavedRef.current) {
+          sessionSavedRef.current = true
+          savePlayerSession({ room: roomCode, name: playerName, avatar, id: playerId })
+        }
+        // Reset local round state ONCE per question. Doing it on every prompt re-broadcast would
+        // wipe a bet the player already placed when, e.g., another player joins mid-prompt.
+        const convId = payload.state.question?.conversationId ?? null
+        if (payload.state.phase === 'lobby') {
+          setMyGuesses({}); setLockedIn(false); setBetState(1); setSwapTargetState(null); setActiveLineId(null); setRfVote(null)
+          roundResetRef.current = null
+          betSentRef.current = false
+        } else if (payload.state.phase === 'prompt' && convId !== null && roundResetRef.current !== convId) {
+          roundResetRef.current = convId
+          betSentRef.current = false
+          setMyGuesses({}); setLockedIn(false); setBetState(1); setSwapTargetState(null); setActiveLineId(null); setRfVote(null)
+        }
+      })
 
-    channel.subscribe(async (status) => {
-      if (status === 'SUBSCRIBED' && !joinedRef.current) {
-        joinedRef.current = true
-        await channel.send({
-          type: 'broadcast',
-          event: 'player_join',
-          payload: {
-            type: 'player_join',
-            playerId,
-            playerName,
-            avatar,
-          } satisfies ChannelMessage,
-        })
-        // Mark ourselves present so the host can see live connect/disconnect.
-        await channel.track({ name: playerName })
-      } else if (status === 'CHANNEL_ERROR') {
-        setError('Could not connect to room. Check the code and try again.')
-      }
-    })
+      channel.on('broadcast', { event: 'speakers_sync' }, ({ payload }: { payload: ChannelMessage }) => {
+        if (payload.type !== 'speakers_sync') return
+        setSpeakers(payload.speakers)
+      })
 
-    channelRef.current = channel
-    return () => { clearTimeout(connectTimeout); channel.unsubscribe() }
+      channel.on('broadcast', { event: 'join_rejected' }, ({ payload }: { payload: ChannelMessage }) => {
+        if (payload.type !== 'join_rejected' || payload.playerId !== playerId) return
+        clearConnectTimer()
+        setError(payload.reason)
+      })
+
+      channel.subscribe(async (status) => {
+        if (status === 'SUBSCRIBED') {
+          // (Re)announce on every (re)subscribe. The host treats a known id as a reconnect and
+          // just resends current state, so this transparently resyncs us after a drop.
+          await channel.send({
+            type: 'broadcast', event: 'player_join',
+            payload: { type: 'player_join', playerId, playerName, avatar } satisfies ChannelMessage,
+          })
+          await channel.track({ name: playerName })
+        }
+        // CHANNEL_ERROR / TIMED_OUT / CLOSED are transient (e.g. the phone backgrounded the
+        // socket). Supabase retries, and we also reconnect on refocus — so no dead-end error here.
+      })
+
+      channelRef.current = channel
+    }
+
+    connect()
+
+    // Mobile browsers suspend the WebSocket when the tab is backgrounded; reconnect on return.
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible' && !disposed) { setError(''); connect() }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+
+    return () => {
+      disposed = true
+      document.removeEventListener('visibilitychange', onVisibility)
+      clearConnectTimer()
+      if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null }
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomCode, playerName])
 

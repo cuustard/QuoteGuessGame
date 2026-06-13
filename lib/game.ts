@@ -111,11 +111,15 @@ export const ALLIN_MIN_BUYIN = 1000 // minimum banked score required to bet All-
 export const SWAP_MISS_PENALTY = 750 // flat points lost if you bet Swap and miss
 export const SWAP_MIN_BUYIN = 500 // minimum banked score required to bet Point Swap
 
-// --- Real or Cap mode ---
-export const RF_POINTS = 500 // flat points for a correct REAL/CAP vote (simple party math)
-
 // --- Survival mode ---
 export const SURVIVAL_LIVES = 3 // lives each player starts with
+export const SURVIVAL_TIMER_STEP_MS = 2000 // guessing window shrinks this much each round
+export const SURVIVAL_TIMER_MIN_MS = 5000 // ...down to this floor
+
+// Survival's shrinking timer: round 1 = base, then −STEP each round, floored at MIN.
+export function survivalTimerMs(base: number, round: number): number {
+  return Math.max(SURVIVAL_TIMER_MIN_MS, base - (round - 1) * SURVIVAL_TIMER_STEP_MS)
+}
 
 export interface RoundScoring {
   deltas: Record<string, number> // total points awarded this round (base*bet + streak bonus, +/- penalties)
@@ -297,24 +301,6 @@ export function buildRfClaim(question: RoundQuestion, speakers: Speaker[]): RfCl
   return { lineId: line.lineId, claimedSpeakerId, claimedSpeakerName, isReal }
 }
 
-// Flat scoring for a Real-or-Cap round: +RF_POINTS for a correct vote, 0 otherwise.
-// perfectRound doubles as "voted correctly" so the drinking overlay and UI reuse it.
-export function scoreRfRound(
-  claim: RfClaim,
-  votes: GameState['rfVotes'],
-  players: Player[]
-): Pick<RoundScoring, 'deltas' | 'perfectRound'> {
-  const deltas: Record<string, number> = {}
-  const perfectRound: Record<string, boolean> = {}
-  const truth: 'real' | 'fake' = claim.isReal ? 'real' : 'fake'
-  for (const p of players) {
-    const right = votes[p.id] === truth
-    perfectRound[p.id] = right
-    deltas[p.id] = right ? RF_POINTS : 0
-  }
-  return { deltas, perfectRound }
-}
-
 // ---- Survival mode ----
 
 export function aliveIds(lives: GameState['lives']): string[] {
@@ -348,6 +334,7 @@ export function createInitialGameState(roomCode: string, totalRounds: number, sp
     lockTimes: {},
     timerStart: null,
     timerDuration: TIMER_DURATION_MS,
+    survivalBaseTimer: TIMER_DURATION_MS,
     promptEnd: null,
     revealedAnswers: {},
     scores: {},

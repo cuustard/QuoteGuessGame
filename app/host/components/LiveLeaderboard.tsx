@@ -27,13 +27,13 @@ export function LiveLeaderboard({ state, present, presenceReady }: { state: Game
                 {p.streak > 1 && <span className="text-base" style={{ color: 'var(--accent)' }}>🔥{p.streak}</span>}
               </div>
               {hearts && <div className="text-base mt-0.5">{hearts}</div>}
-              {(state.phase === 'guessing' || state.phase === 'reveal') && ((state.mode === 'classic' && bet !== 1) || locked) && (
+              {(state.phase === 'guessing' || state.phase === 'reveal') && ((state.mode !== 'survival' && bet !== 1) || locked) && (
                 <div className="text-base flex items-center gap-1.5 mt-0.5" style={{ color: 'var(--muted)' }}>
-                  {locked && <span style={{ color: 'var(--correct)' }}>✓ locked</span>}
-                  {state.mode === 'classic' && bet === 'swap' && <span style={{ color: 'var(--accent)' }}>🔀 swap</span>}
-                  {state.mode === 'classic' && bet === 3 && <span style={{ color: 'var(--incorrect)' }}>💀 all-in</span>}
-                  {state.mode === 'classic' && bet === 2 && <span style={{ color: 'var(--incorrect)' }}>🔥 ×2</span>}
-                  {state.mode === 'classic' && bet === 0.5 && <span>🛡 safe</span>}
+                  {locked && <span style={{ color: 'var(--correct)' }}>{state.mode === 'realfake' ? '✓ voted' : '✓ locked'}</span>}
+                  {state.mode !== 'survival' && bet === 'swap' && <span style={{ color: 'var(--accent)' }}>🔀 swap</span>}
+                  {state.mode !== 'survival' && bet === 3 && <span style={{ color: 'var(--incorrect)' }}>💀 all-in</span>}
+                  {state.mode !== 'survival' && bet === 2 && <span style={{ color: 'var(--incorrect)' }}>🔥 ×2</span>}
+                  {state.mode !== 'survival' && bet === 0.5 && <span>🛡 safe</span>}
                 </div>
               )}
             </div>

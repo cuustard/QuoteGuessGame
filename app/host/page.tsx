@@ -8,11 +8,11 @@ import {
   generateRoomCode, fetchSpeakers, fetchRandomConversation,
   buildRoundQuestion, scoreRound, applyScoreDeltas, createInitialGameState,
   computeRoundDrinks, computeRfDrink, drinkResultText, roundDrinkCallouts,
-  buildRfClaim, scoreRfRound, applyLifeLoss, aliveIds, SURVIVAL_LIVES,
+  buildRfClaim, applyLifeLoss, aliveIds, SURVIVAL_LIVES, survivalTimerMs,
   TIMER_DURATION_MS,
 } from '@/lib/game'
 import { unlockAudio, playTick, playReveal } from '@/lib/sounds'
-import type { GameState, GameMode, Player, ChannelMessage } from '@/lib/types'
+import type { GameState, GameMode, Player, RoundQuestion, ChannelMessage } from '@/lib/types'
 import { RealtimeChannel } from '@supabase/supabase-js'
 import { ContextBar } from './components/ContextBar'
 import { Typewriter, TYPE_SPEED_MS } from './components/Typewriter'
@@ -124,14 +124,26 @@ export default function HostPage() {
       })),
     }
 
-    // Real or Cap: flat points for a correct vote; no bets, streaks, or swaps.
+    // Real or Cap: score like a one-line classic round where "voted correctly" = "perfect",
+    // so it reuses the full confidence-bet system (Safe/Risky/All-In/Swap, streaks, speed bonus).
     if (cur.mode === 'realfake') {
       if (!cur.rfClaim) return
-      const { deltas, perfectRound } = scoreRfRound(cur.rfClaim, cur.rfVotes, cur.players)
-      const updatedPlayers = cur.players.map((p) => ({ ...p, score: p.score + (deltas[p.id] ?? 0) }))
+      const truth: 'real' | 'fake' = cur.rfClaim.isReal ? 'real' : 'fake'
+      const lid = cur.rfClaim.lineId
+      const CORRECT = 1 // synthetic "right answer" marker; a wrong/absent vote maps to 0
+      const syntheticQ: RoundQuestion = {
+        conversationId: cur.question.conversationId, context: null, happenedAt: null,
+        lines: [{ lineId: lid, lineOrder: 0, lineText: '', actionText: null }],
+        correctAnswers: { [lid]: CORRECT },
+      }
+      const syntheticGuesses: GameState['guesses'] = {
+        [lid]: Object.fromEntries(cur.players.map((p) => [p.id, cur.rfVotes[p.id] === truth ? CORRECT : 0])),
+      }
+      const { deltas, streakBonuses, perfectRound, executedSwaps } = scoreRound(syntheticQ, syntheticGuesses, cur.players, cur.timerStart ?? Date.now(), cur.timerDuration, cur.lockTimes, cur.bets, cur.swapTargets)
+      const updatedPlayers = applyScoreDeltas(cur.players, deltas, perfectRound, executedSwaps)
       broadcast({
         ...cur, phase: 'reveal', revealedAnswers, question: questionWithNames,
-        scores: deltas, streakBonuses: {}, perfectRound, executedSwaps: [], players: updatedPlayers,
+        scores: deltas, streakBonuses, perfectRound, executedSwaps, players: updatedPlayers,
       })
       return
     }
@@ -228,7 +240,12 @@ export default function HostPage() {
       const cur = stateRef.current
       if (cur?.phase !== 'guessing' || cur.mode !== 'realfake') return
       if (!cur.players.find((p) => p.id === payload.playerId)) return
-      const next = commitState((c) => ({ ...c, rfVotes: { ...c.rfVotes, [payload.playerId]: payload.vote } }))
+      const now = Date.now() // vote time → drives the speed bonus, same as a classic guess
+      const next = commitState((c) => ({
+        ...c,
+        rfVotes: { ...c.rfVotes, [payload.playerId]: payload.vote },
+        lockTimes: c.lockTimes[payload.playerId] === undefined ? { ...c.lockTimes, [payload.playerId]: now } : c.lockTimes,
+      }))
       checkAllGuessed(next)
     })
 
@@ -323,12 +340,17 @@ export default function HostPage() {
     // and default the fields those snapshots don't have.
     const legacyMode = resumable.state.mode as GameMode | 'normal' | 'drinking'
     const mode: GameMode = legacyMode === 'normal' || legacyMode === 'drinking' ? 'classic' : legacyMode
+    // Recover the survival base timer (older saves lack it) and restore timerDuration to that base,
+    // so a host reload mid-survival resumes the ramp from the right value instead of a shrunk one.
+    const survivalBaseTimer = resumable.state.survivalBaseTimer ?? resumable.state.timerDuration
     const resumedState: GameState = {
       ...resumable.state,
       phase: 'lobby',
       speakers: spkrs,
       mode,
       drinking: resumable.state.drinking ?? legacyMode === 'drinking',
+      survivalBaseTimer,
+      timerDuration: survivalBaseTimer,
       rfClaim: resumable.state.rfClaim ?? null,
       rfVotes: resumable.state.rfVotes ?? {},
       lives: resumable.state.lives ?? {},
@@ -352,7 +374,8 @@ export default function HostPage() {
   function setTimerDuration(ms: number) {
     const cur = stateRef.current
     if (!cur || cur.phase !== 'lobby') return
-    broadcast({ ...cur, timerDuration: ms })
+    // Keep the base in lockstep with the lobby pick so survival ramps from the right value.
+    broadcast({ ...cur, timerDuration: ms, survivalBaseTimer: ms })
   }
 
   function setMode(mode: GameMode) {
@@ -379,10 +402,18 @@ export default function HostPage() {
     const question = buildRoundQuestion(conv)
     // Real or Cap: attribute one line to a claimed speaker (50/50 truth or cap).
     const rfClaim = cur.mode === 'realfake' ? buildRfClaim(question, cur.speakers) : null
-    // Survival: deal everyone their lives when the game starts (first round out of the lobby).
-    const lives = cur.mode === 'survival' && cur.phase === 'lobby'
-      ? Object.fromEntries(cur.players.map((p) => [p.id, SURVIVAL_LIVES]))
+    const nextRound = advance ? cur.currentRound + 1 : cur.currentRound
+    // Survival: every player keeps their current lives; anyone without an entry yet (fresh game,
+    // or a late joiner) is dealt a full set. This preserves elimination progress across a host
+    // resume (which routes back through the lobby) instead of resetting everyone to full.
+    const lives = cur.mode === 'survival'
+      ? Object.fromEntries(cur.players.map((p) => [p.id, cur.lives[p.id] ?? SURVIVAL_LIVES]))
       : cur.lives
+    // Survival's guessing window shrinks each round, computed from the persisted base
+    // (survives a host reload); other modes keep the fixed lobby timer.
+    const timerDuration = cur.mode === 'survival'
+      ? survivalTimerMs(cur.survivalBaseTimer, nextRound)
+      : cur.timerDuration
     const contextChars = question.context?.length ?? 0
     const quoteChars = (cur.mode === 'realfake' && rfClaim
       ? question.lines.filter((l) => l.lineId === rfClaim.lineId)
@@ -394,8 +425,9 @@ export default function HostPage() {
     const nextState: GameState = {
       ...cur,
       phase: 'prompt',
-      currentRound: advance ? cur.currentRound + 1 : cur.currentRound,
+      currentRound: nextRound,
       promptEnd,
+      timerDuration,
       question, guesses: {}, lockTimes: {}, timerStart: null, revealedAnswers: {}, scores: {}, streakBonuses: {}, perfectRound: {}, bets: {}, swapTargets: {}, executedSwaps: [],
       rfClaim, rfVotes: {}, lives,
     }
@@ -444,9 +476,13 @@ export default function HostPage() {
   function continueAfterReveal() {
     const cur = stateRef.current
     if (!cur) return
-    // Survival ends early once one (or zero) players are left standing.
-    const survivalOver = cur.mode === 'survival' && aliveIds(cur.lives).length <= 1
-    if (survivalOver || cur.currentRound >= cur.totalRounds) broadcast({ ...cur, phase: 'leaderboard' })
+    // Survival runs infinitely until one (or zero) players remain — totalRounds doesn't apply.
+    if (cur.mode === 'survival') {
+      if (aliveIds(cur.lives).length <= 1) broadcast({ ...cur, phase: 'leaderboard' })
+      else startNextRound(true)
+      return
+    }
+    if (cur.currentRound >= cur.totalRounds) broadcast({ ...cur, phase: 'leaderboard' })
     else startNextRound(true)
   }
 
@@ -462,7 +498,9 @@ export default function HostPage() {
       ...createInitialGameState(cur.roomCode, cur.totalRounds, cur.speakers),
       mode: cur.mode,
       drinking: cur.drinking,
-      timerDuration: cur.timerDuration,
+      // Restore the lobby's base timer (survival ramps cur.timerDuration down during play).
+      timerDuration: cur.survivalBaseTimer,
+      survivalBaseTimer: cur.survivalBaseTimer,
       players: resetPlayers,
     })
   }
@@ -541,7 +579,9 @@ export default function HostPage() {
         </div>
         <div className="flex items-center gap-5 sm:gap-8">
           {state.phase !== 'lobby' && state.phase !== 'leaderboard' && (
-            <span className="text-2xl font-bold whitespace-nowrap" style={{ color: 'var(--muted)' }}>Round {state.currentRound}/{state.totalRounds}</span>
+            <span className="text-2xl font-bold whitespace-nowrap" style={{ color: 'var(--muted)' }}>
+              Round {state.currentRound}{state.mode === 'survival' ? '' : `/${state.totalRounds}`}
+            </span>
           )}
           {(state.phase === 'prompt' || state.phase === 'guessing') && (
             <button onClick={skipRound}
@@ -559,100 +599,101 @@ export default function HostPage() {
       <div className="flex-1 flex gap-6 min-h-0 w-full">
         <div className="flex-1 flex flex-col min-w-0">
 
-      {/* Lobby */}
+      {/* Lobby — two columns: join (QR/code) on the left, settings + players + start on the right */}
       {state.phase === 'lobby' && (
-        <div className="flex-1 flex flex-col items-center justify-center gap-8 animate-slide-up">
-          <div className="text-center space-y-3">
-            <h2 className="text-5xl font-black">Waiting for players…</h2>
-            <p className="text-2xl" style={{ color: 'var(--muted)' }}>Scan the code or enter it manually</p>
-          </div>
-          <div className="flex flex-col sm:flex-row items-center gap-10">
+        <div className="flex-1 flex items-center justify-center gap-16 animate-slide-up min-h-0">
+          {/* Left: join */}
+          <div className="flex flex-col items-center gap-4 shrink-0">
             <JoinQR roomCode={state.roomCode} />
-            <div className="text-8xl font-black tracking-[0.3em]" style={{ color: 'var(--accent)' }}>{state.roomCode}</div>
+            <div className="text-7xl font-black tracking-[0.3em]" style={{ color: 'var(--accent)' }}>{state.roomCode}</div>
+            <p className="text-xl" style={{ color: 'var(--muted)' }}>Scan or enter the code to join</p>
           </div>
 
-          <div className="flex flex-wrap gap-3 justify-center max-w-4xl min-h-[3rem]">
-            {state.players.map((p) => {
-              const off = presenceReady && !presentIds.has(p.id)
-              return (
-                <div key={p.id} className="rounded-full px-6 py-3 text-2xl font-bold animate-bounce-in flex items-center gap-2"
-                  style={{ background: 'var(--surface)', border: `2px solid ${off ? 'var(--muted)' : 'var(--primary)'}`, opacity: off ? 0.5 : 1 }}>
-                  <span>{p.avatar}</span>{p.name}{off && <span title="disconnected">📴</span>}
-                </div>
-              )
-            })}
-          </div>
+          {/* Right: lobby controls */}
+          <div className="flex flex-col gap-5 w-[44rem] shrink-0">
+            <h2 className="text-4xl font-black">Waiting for players…</h2>
 
-          {/* Round count selector */}
-          <div className="flex items-center gap-4">
-            <span className="text-2xl" style={{ color: 'var(--muted)' }}>Rounds:</span>
-            {ROUND_OPTIONS.map((n) => (
-              <button key={n} onClick={() => setRoundCount(n)}
-                className="rounded-lg px-6 py-3 text-xl font-bold transition-all"
-                style={{
-                  background: state.totalRounds === n ? 'var(--primary)' : 'var(--surface)',
-                  color: state.totalRounds === n ? '#fff' : 'var(--muted)',
-                }}>{n}</button>
-            ))}
-          </div>
-
-          {/* Timer duration selector */}
-          <div className="flex items-center gap-4">
-            <span className="text-2xl" style={{ color: 'var(--muted)' }}>Timer:</span>
-            {TIMER_OPTIONS_SEC.map((s) => (
-              <button key={s} onClick={() => setTimerDuration(s * 1000)}
-                className="rounded-lg px-6 py-3 text-xl font-bold transition-all"
-                style={{
-                  background: state.timerDuration === s * 1000 ? 'var(--primary)' : 'var(--surface)',
-                  color: state.timerDuration === s * 1000 ? '#fff' : 'var(--muted)',
-                }}>{s}s</button>
-            ))}
-          </div>
-
-          {/* Game mode selector */}
-          <div className="flex flex-col items-center gap-3">
-            <div className="flex items-center gap-4">
-              <span className="text-2xl" style={{ color: 'var(--muted)' }}>Mode:</span>
-              {([
-                { m: 'classic' as GameMode, label: '🏆 Classic' },
-                { m: 'realfake' as GameMode, label: '🕵 Real or Cap' },
-                { m: 'survival' as GameMode, label: '💀 Survival' },
-              ]).map(({ m, label }) => (
-                <button key={m} onClick={() => setMode(m)}
-                  className="rounded-lg px-6 py-3 text-xl font-bold transition-all"
-                  style={{ background: state.mode === m ? 'var(--primary)' : 'var(--surface)', color: state.mode === m ? '#fff' : 'var(--muted)' }}>
-                  {label}
-                </button>
-              ))}
+            {/* Joined players */}
+            <div className="flex flex-wrap gap-2 min-h-[3.25rem] content-start max-h-32 overflow-hidden">
+              {state.players.length === 0
+                ? <span className="text-xl self-center" style={{ color: 'var(--muted)' }}>No one&apos;s joined yet…</span>
+                : state.players.map((p) => {
+                    const off = presenceReady && !presentIds.has(p.id)
+                    return (
+                      <div key={p.id} className="rounded-full px-4 py-2 text-xl font-bold animate-bounce-in flex items-center gap-2"
+                        style={{ background: 'var(--surface)', border: `2px solid ${off ? 'var(--muted)' : 'var(--primary)'}`, opacity: off ? 0.5 : 1 }}>
+                        <span>{p.avatar}</span>{p.name}{off && <span title="disconnected">📴</span>}
+                      </div>
+                    )
+                  })}
             </div>
-            <p className="text-lg text-center max-w-2xl" style={{ color: 'var(--muted)' }}>
-              {state.mode === 'classic' && 'Guess who said it — points, streaks & confidence bets.'}
-              {state.mode === 'realfake' && 'A quote appears with a name on it. Vote REAL or CAP — flat 500 points per correct call.'}
-              {state.mode === 'survival' && `Everyone starts with ${SURVIVAL_LIVES} lives. Miss a round = lose one. Last one standing wins.`}
-            </p>
-          </div>
 
-          {/* Drinking overlay toggle — stacks on any mode */}
-          <div className="flex flex-col items-center gap-3">
-            <button onClick={() => setDrinking(!state.drinking)}
-              className="rounded-lg px-6 py-3 text-xl font-bold transition-all"
-              style={{ background: state.drinking ? 'var(--accent)' : 'var(--surface)', color: state.drinking ? '#000' : 'var(--muted)' }}>
-              🍺 Tipsy Edition: {state.drinking ? 'ON' : 'OFF'}
-            </button>
-            {state.drinking && (
-              <p className="text-lg text-center max-w-xl" style={{ color: 'var(--muted)' }}>
-                Wrong = a sip · whiff it all = a shot · 21+, drink responsibly, know your limits.
-              </p>
-            )}
-          </div>
+            {/* Rounds — survival is infinite (until one remains), so no fixed count */}
+            <div className="flex items-center gap-3">
+              <span className="text-2xl w-28 shrink-0" style={{ color: 'var(--muted)' }}>Rounds</span>
+              {state.mode === 'survival'
+                ? <span className="text-xl font-bold px-2" style={{ color: 'var(--accent)' }}>∞ — until one survivor remains</span>
+                : ROUND_OPTIONS.map((n) => (
+                    <button key={n} onClick={() => setRoundCount(n)}
+                      className="rounded-lg px-5 py-2.5 text-xl font-bold transition-all"
+                      style={{ background: state.totalRounds === n ? 'var(--primary)' : 'var(--surface)', color: state.totalRounds === n ? '#fff' : 'var(--muted)' }}>{n}</button>
+                  ))}
+            </div>
 
-          {state.players.length > 0 && (
-            <button onClick={() => startNextRound(true)}
-              className="rounded-2xl px-16 py-6 text-3xl font-black transition-all hover:scale-105"
-              style={{ background: 'var(--primary)', color: '#fff' }}>
-              Start Game ({state.players.length} player{state.players.length !== 1 ? 's' : ''})
+            {/* Timer (survival: this is the STARTING window — it shrinks each round) */}
+            <div className="flex items-center gap-3">
+              <span className="text-2xl w-28 shrink-0" style={{ color: 'var(--muted)' }}>{state.mode === 'survival' ? 'Start' : 'Timer'}</span>
+              {TIMER_OPTIONS_SEC.map((s) => (
+                <button key={s} onClick={() => setTimerDuration(s * 1000)}
+                  className="rounded-lg px-5 py-2.5 text-xl font-bold transition-all"
+                  style={{ background: state.timerDuration === s * 1000 ? 'var(--primary)' : 'var(--surface)', color: state.timerDuration === s * 1000 ? '#fff' : 'var(--muted)' }}>{s}s</button>
+              ))}
+              {state.mode === 'survival' && <span className="text-sm" style={{ color: 'var(--muted)' }}>shrinks each round ⚡</span>}
+            </div>
+
+            {/* Mode */}
+            <div className="flex items-start gap-3">
+              <span className="text-2xl w-28 shrink-0 pt-2.5" style={{ color: 'var(--muted)' }}>Mode</span>
+              <div className="flex-1 space-y-2">
+                <div className="flex gap-2">
+                  {([
+                    { m: 'classic' as GameMode, label: '🏆 Classic' },
+                    { m: 'realfake' as GameMode, label: '🕵 Real or Cap' },
+                    { m: 'survival' as GameMode, label: '💀 Survival' },
+                  ]).map(({ m, label }) => (
+                    <button key={m} onClick={() => setMode(m)}
+                      className="rounded-lg px-4 py-2.5 text-lg font-bold transition-all"
+                      style={{ background: state.mode === m ? 'var(--primary)' : 'var(--surface)', color: state.mode === m ? '#fff' : 'var(--muted)' }}>
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-base" style={{ color: 'var(--muted)' }}>
+                  {state.mode === 'classic' && 'Guess who said it — points, streaks & confidence bets.'}
+                  {state.mode === 'realfake' && 'A quote appears with a name on it. Place a confidence bet, then vote REAL or CAP.'}
+                  {state.mode === 'survival' && `Everyone starts with ${SURVIVAL_LIVES} lives. Miss a round = lose one. Last one standing wins.`}
+                </p>
+              </div>
+            </div>
+
+            {/* Tipsy overlay */}
+            <div className="flex items-center gap-3">
+              <span className="text-2xl w-28 shrink-0" style={{ color: 'var(--muted)' }}>Tipsy</span>
+              <button onClick={() => setDrinking(!state.drinking)}
+                className="rounded-lg px-5 py-2.5 text-lg font-bold transition-all"
+                style={{ background: state.drinking ? 'var(--accent)' : 'var(--surface)', color: state.drinking ? '#000' : 'var(--muted)' }}>
+                🍺 {state.drinking ? 'ON' : 'OFF'}
+              </button>
+              {state.drinking && <span className="text-sm" style={{ color: 'var(--muted)' }}>Wrong = sip · whiff it all = shot · 21+, know your limits</span>}
+            </div>
+
+            {/* Start */}
+            <button onClick={() => startNextRound(true)} disabled={state.players.length === 0}
+              className="rounded-2xl py-5 text-3xl font-black transition-all hover:scale-[1.02] mt-1"
+              style={{ background: state.players.length === 0 ? 'var(--surface)' : 'var(--primary)', color: state.players.length === 0 ? 'var(--muted)' : '#fff', cursor: state.players.length === 0 ? 'not-allowed' : 'pointer', opacity: state.players.length === 0 ? 0.6 : 1 }}>
+              {state.players.length === 0 ? 'Waiting for players…' : `Start Game (${state.players.length} player${state.players.length !== 1 ? 's' : ''})`}
             </button>
-          )}
+          </div>
         </div>
       )}
 
@@ -719,6 +760,11 @@ export default function HostPage() {
           </div>
           {state.mode === 'realfake' && (
             <p className="text-3xl font-black text-center animate-pulse" style={{ color: 'var(--accent)' }}>REAL or CAP? Vote on your phone!</p>
+          )}
+          {state.mode === 'survival' && (
+            <p className="text-2xl font-bold text-center" style={{ color: 'var(--incorrect)' }}>
+              💀 {Math.round(state.timerDuration / 1000)}s to answer — miss and you lose a life ⚡
+            </p>
           )}
           <div className="mt-auto lg:hidden">
             <p className="text-xs uppercase tracking-widest mb-3" style={{ color: 'var(--muted)' }}>Answers in</p>

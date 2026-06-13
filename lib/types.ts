@@ -82,7 +82,8 @@ export interface GameState {
   // playerId -> epoch ms when they finished answering every line (drives the individual speed bonus)
   lockTimes: Record<string, number>
   timerStart: number | null // epoch ms
-  timerDuration: number // ms — configurable by host in lobby
+  timerDuration: number // ms — the CURRENT round's guessing window (survival ramps this down)
+  survivalBaseTimer: number // ms — the lobby-chosen base, before survival's per-round ramp (persisted)
   promptEnd: number | null // epoch ms when prompt phase ends and guessing begins
   // revealed: lineId -> speakerId (set during reveal phase)
   revealedAnswers: Record<number, number>

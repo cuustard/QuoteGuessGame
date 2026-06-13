@@ -187,7 +187,7 @@ function PlayerController() {
   // Blind Confidence: the bet is chosen during the prompt phase and transmitted the instant
   // guessing opens — before any guess can end the round — so no one is mid-bet at round end.
   useEffect(() => {
-    if (gameState?.phase !== 'guessing' || gameState.mode !== 'classic' || betSentRef.current) return
+    if (gameState?.phase !== 'guessing' || gameState.mode === 'survival' || betSentRef.current) return
     betSentRef.current = true
     const ch = channelRef.current
     if (!ch) return
@@ -350,6 +350,8 @@ function PlayerController() {
   // Read-only label for the bet locked in during the prompt phase.
   const betLabel = bet === 'swap' ? '🔀 Point Swap' : bet === 3 ? '💀 All-In' : bet === 2 ? '🔥 Risky ×2' : bet === 0.5 ? '🛡 Safe ×0.5' : '😐 No bet'
 
+  // Confidence betting is available in classic and Real or Cap (survival's stakes are lives).
+  const betsEnabled = gameState.mode === 'classic' || gameState.mode === 'realfake'
   // Mode-derived: RF rounds show only the claimed line; survival tracks my lives.
   const promptLines = gameState.mode === 'realfake' && gameState.rfClaim
     ? (gameState.question?.lines ?? []).filter((l) => l.lineId === gameState.rfClaim!.lineId)
@@ -468,7 +470,7 @@ function PlayerController() {
               <p className="font-black" style={{ color: 'var(--accent)' }}>
                 🕵 Did {gameState.rfClaim.claimedSpeakerName} really say this?
               </p>
-              <p className="text-xs mt-1" style={{ color: 'var(--muted)' }}>Voting opens when the countdown ends — +500 for the right call.</p>
+              <p className="text-xs mt-1" style={{ color: 'var(--muted)' }}>Place your bet, then vote REAL or CAP when voting opens.</p>
             </div>
           )}
 
@@ -481,8 +483,8 @@ function PlayerController() {
             </div>
           )}
 
-          {/* Place your bet — classic mode only (RF votes / survival lives are the stakes) */}
-          {gameState.mode === 'classic' && (
+          {/* Place your bet — classic & Real or Cap (survival's stakes are lives) */}
+          {betsEnabled && (
           <div className="rounded-2xl p-3 space-y-2" style={{ background: 'var(--surface)' }}>
             <p className="text-xs uppercase tracking-widest text-center" style={{ color: 'var(--muted)' }}>Place your bet</p>
 
@@ -495,7 +497,7 @@ function PlayerController() {
                 border: bet === 1 ? '2px solid var(--primary-light)' : '2px solid transparent',
               }}>
               😐 NO BET
-              <span className="block text-[10px] font-normal opacity-80 mt-0.5">Full points if perfect — but <b>−100</b> if you miss a line</span>
+              <span className="block text-[10px] font-normal opacity-80 mt-0.5">Full points if you nail it — but <b>−100</b> if you&apos;re wrong</span>
             </button>
 
             {/* Separator */}
@@ -557,14 +559,14 @@ function PlayerController() {
 
             {/* Selected-bet explainer */}
             {bet === 0.5 && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Half the points you earn — but <b>zero risk</b>. A safe hedge.</p>}
-            {bet === 2 && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Need a <b>perfect</b> round to win ×2 — miss any line and you lose <b style={{ color: 'var(--incorrect)' }}>500</b>.</p>}
-            {bet === 3 && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Perfect round = <b style={{ color: 'var(--correct)' }}>DOUBLE your total score</b>. Miss any line = <b style={{ color: 'var(--incorrect)' }}>lose EVERYTHING</b>. 💀</p>}
-            {bet === 'swap' && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Perfect round = steal their score. Miss and you lose <b style={{ color: 'var(--incorrect)' }}>750 pts</b>.</p>}
+            {bet === 2 && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Nail it to win <b>×2</b> — get it wrong and you lose <b style={{ color: 'var(--incorrect)' }}>500</b>.</p>}
+            {bet === 3 && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Nail it = <b style={{ color: 'var(--correct)' }}>DOUBLE your total score</b>. Wrong = <b style={{ color: 'var(--incorrect)' }}>lose EVERYTHING</b>. 💀</p>}
+            {bet === 'swap' && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Nail it = steal their score. Wrong and you lose <b style={{ color: 'var(--incorrect)' }}>750 pts</b>.</p>}
           </div>
           )}
 
           {/* Swap target picker */}
-          {gameState.mode === 'classic' && bet === 'swap' && (
+          {betsEnabled && bet === 'swap' && (
             <div className="rounded-2xl p-3" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
               <p className="text-xs uppercase tracking-widest text-center mb-2 font-black" style={{ color: 'var(--accent)' }}>Who do you want to swap with?</p>
               <div className="flex flex-col gap-2">
@@ -594,7 +596,7 @@ function PlayerController() {
             )}
             <p className="text-xs" style={{ color: 'var(--muted)' }}>
               {gameState.mode === 'classic' && 'Lock in a bet — guessing opens when the timer hits zero'}
-              {gameState.mode === 'realfake' && 'Think it over — voting opens when the timer hits zero'}
+              {gameState.mode === 'realfake' && 'Lock in a bet — voting opens when the timer hits zero'}
               {gameState.mode === 'survival' && (amEliminated ? 'Watch the chaos unfold 🍿' : 'Get it right or lose a life — guessing opens soon')}
             </p>
           </div>
@@ -609,6 +611,13 @@ function PlayerController() {
               <span className="font-black" style={{ color: 'var(--accent)' }}>{gameState.rfClaim.claimedSpeakerName}</span>{' '}
               &ldquo;{promptLines[0]?.lineText}&rdquo;
             </p>
+          </div>
+          <div className="rounded-xl px-3 py-2 flex items-center justify-center gap-2 text-xs" style={{ background: 'var(--surface)' }}>
+            <span style={{ color: 'var(--muted)' }}>Bet locked:</span>
+            <span className="font-bold" style={{ color: 'var(--text)' }}>{betLabel}</span>
+            {bet === 'swap' && swapTarget && (
+              <span className="font-bold" style={{ color: 'var(--accent)' }}>→ {gameState.players.find((p) => p.id === swapTarget)?.name}</span>
+            )}
           </div>
           {!rfVote ? (
             <div className="grid grid-cols-2 gap-3 flex-1 max-h-72">
@@ -775,8 +784,20 @@ function PlayerController() {
               </p>
               {!gameState.rfClaim.isReal && <p className="text-sm" style={{ color: 'var(--muted)' }}>It was actually <b style={{ color: 'var(--text)' }}>{truthName}</b></p>}
               <p className="text-lg font-bold" style={{ color: right ? 'var(--correct)' : 'var(--incorrect)' }}>
-                {rfVote === null ? '😴 You didn’t vote' : right ? `You called it! +${gameState.scores[playerId] ?? 0}` : 'You got played 💀'}
+                {rfVote === null ? '😴 You didn’t vote' : right ? 'You called it! 🎯' : 'You got played 💀'}
               </p>
+              {(() => {
+                const delta = gameState.scores[playerId] ?? 0
+                const usedBet = gameState.bets[playerId] ?? 1
+                return (
+                  <p className="text-sm font-bold" style={{ color: delta >= 0 ? 'var(--correct)' : 'var(--incorrect)' }}>
+                    {delta >= 0 ? '+' : ''}{delta} this round
+                    {(usedBet === 0.5 || usedBet === 2) && <span style={{ color: 'var(--muted)' }}> · ×{usedBet} bet</span>}
+                    {usedBet === 3 && <span style={{ color: 'var(--muted)' }}> · all-in</span>}
+                    {usedBet === 'swap' && <span style={{ color: 'var(--muted)' }}> · 🔀 swap</span>}
+                  </p>
+                )
+              })()}
             </div>
             {gameState.drinking && (
               <div className="rounded-2xl p-5 text-center animate-bounce-in"

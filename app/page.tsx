@@ -4,22 +4,18 @@ import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { loadPlayerSession, clearPlayerSession, type PlayerSession } from '@/lib/session'
 
-const AVATARS = ['😎', '🦄', '🐸', '👽', '🤡', '🐯', '🦊', '🐙', '🦖', '👻', '🤖', '🍕', '🌮', '💀', '🦩', '🐧']
-
 export default function JoinPage() {
   const router = useRouter()
   const [roomCode, setRoomCode] = useState('')
   const [name, setName] = useState('')
-  const [avatar, setAvatar] = useState(AVATARS[0])
   const [error, setError] = useState('')
   const [returning, setReturning] = useState<PlayerSession | null>(null)
 
-  // Prefill the code when arriving from the host's QR code (/?room=ABCD); random avatar.
+  // Prefill the code when arriving from the host's QR code (/?room=ABCD).
   useEffect(() => {
     const fromQuery = new URLSearchParams(window.location.search).get('room')
     /* eslint-disable react-hooks/set-state-in-effect */
     if (fromQuery) setRoomCode(fromQuery.toUpperCase().slice(0, 4))
-    setAvatar(AVATARS[Math.floor(Math.random() * AVATARS.length)])
     setReturning(loadPlayerSession())
     /* eslint-enable react-hooks/set-state-in-effect */
   }, [])
@@ -30,12 +26,12 @@ export default function JoinPage() {
     const playerName = name.trim()
     if (code.length !== 4) { setError('Enter a 4-character room code'); return }
     if (!playerName) { setError('Enter your name'); return }
-    router.push(`/play?room=${code}&name=${encodeURIComponent(playerName)}&avatar=${encodeURIComponent(avatar)}`)
+    router.push(`/play?room=${code}&name=${encodeURIComponent(playerName)}`)
   }
 
   function rejoin() {
     if (!returning) return
-    router.push(`/play?room=${returning.room}&name=${encodeURIComponent(returning.name)}&avatar=${encodeURIComponent(returning.avatar)}`)
+    router.push(`/play?room=${returning.room}&name=${encodeURIComponent(returning.name)}`)
   }
 
   function dismissReturning() {
@@ -47,7 +43,6 @@ export default function JoinPage() {
     <main className="flex min-h-dvh flex-col items-center justify-center p-6">
       <div className="w-full max-w-sm space-y-8 animate-slide-up">
         <div className="text-center space-y-2">
-          <div className="text-6xl mb-4">🎤</div>
           <h1 className="text-4xl font-black tracking-tight" style={{ color: 'var(--primary-light)' }}>
             Who Said It?
           </h1>
@@ -57,12 +52,12 @@ export default function JoinPage() {
         {returning && (
           <div className="rounded-2xl p-4 space-y-3 animate-bounce-in" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
             <p className="text-sm font-bold text-center">
-              👋 Looks like you got disconnected from room <span style={{ color: 'var(--accent)' }}>{returning.room}</span>.
+              Looks like you got disconnected from room <span style={{ color: 'var(--accent)' }}>{returning.room}</span>.
             </p>
             <button onClick={rejoin}
               className="w-full rounded-xl py-3 text-lg font-black transition-all active:scale-95"
               style={{ background: 'var(--accent)', color: '#000' }}>
-              {returning.avatar} Rejoin as {returning.name} →
+              Rejoin as {returning.name}
             </button>
             <button onClick={dismissReturning} className="w-full text-xs underline" style={{ color: 'var(--muted)' }}>
               Not you? Start fresh
@@ -103,28 +98,6 @@ export default function JoinPage() {
             />
           </div>
 
-          <div className="space-y-1">
-            <label className="text-xs font-semibold uppercase tracking-widest" style={{ color: 'var(--muted)' }}>
-              Pick an Avatar
-            </label>
-            <div className="grid grid-cols-8 gap-1">
-              {AVATARS.map((a) => (
-                <button
-                  key={a}
-                  type="button"
-                  onClick={() => setAvatar(a)}
-                  className="aspect-square rounded-lg text-2xl flex items-center justify-center transition-all active:scale-90"
-                  style={{
-                    background: avatar === a ? 'var(--primary)' : 'var(--surface)',
-                    border: avatar === a ? '2px solid var(--primary-light)' : '2px solid transparent',
-                  }}
-                >
-                  {a}
-                </button>
-              ))}
-            </div>
-          </div>
-
           {error && <p className="text-sm text-center" style={{ color: 'var(--incorrect)' }}>{error}</p>}
 
           <button
@@ -132,7 +105,7 @@ export default function JoinPage() {
             className="w-full rounded-xl py-4 text-xl font-black transition-all active:scale-95"
             style={{ background: 'var(--primary)', color: '#fff' }}
           >
-            {avatar} Join Game →
+            Join Game
           </button>
         </form>
 

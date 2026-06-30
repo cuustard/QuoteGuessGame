@@ -92,6 +92,8 @@ export function buildRoundQuestion(conv: Conversation): RoundQuestion {
 }
 
 export const TIMER_DURATION_MS = 20_000
+// How long the answer/reveal screen stays up before auto-advancing (when enabled).
+export const REVEAL_DURATION_MS = 12_000
 export const POINTS_MAX = 1000
 export const POINTS_MIN = 100
 
@@ -112,9 +114,22 @@ export const SWAP_MISS_PENALTY = 750 // flat points lost if you bet Swap and mis
 export const SWAP_MIN_BUYIN = 500 // minimum banked score required to bet Point Swap
 
 // --- Survival mode ---
-export const SURVIVAL_LIVES = 3 // lives each player starts with
+export const SURVIVAL_LIVES = 3 // lives each player starts with (also the cap for regen)
 export const SURVIVAL_TIMER_STEP_MS = 2000 // guessing window shrinks this much each round
 export const SURVIVAL_TIMER_MIN_MS = 5000 // ...down to this floor
+export const SURVIVAL_STREAK_REGEN = 3 // a perfect-round streak of this length regenerates 1 life
+
+// Life loss scales with how punishing the round was relative to its length, so a single slip on
+// a long multi-part quote isn't as brutal as whiffing a one-liner:
+//   1-part: 1 wrong = −1
+//   2-part: 1 wrong = −0.5 | 2 wrong = −1
+//   3-part: 1 wrong = −0.5 | 2 wrong = −1 | 3 wrong = −1
+export function survivalLifeLoss(total: number, wrong: number): number {
+  if (wrong <= 0) return 0
+  if (total <= 1) return 1
+  if (wrong === 1) return 0.5
+  return 1
+}
 
 // Survival's shrinking timer: round 1 = base, then −STEP each round, floored at MIN.
 export function survivalTimerMs(base: number, round: number): number {
@@ -126,6 +141,7 @@ export interface RoundScoring {
   streakBonuses: Record<string, number> // just the streak-bonus portion
   perfectRound: Record<string, boolean> // true if player got every line right
   executedSwaps: Array<{ winnerId: string; loserId: string }> // point swaps that fired
+  blockedSwaps: Array<{ attackerId: string; defenderId: string }> // swaps stopped by a Shield
 }
 
 // Exact per-player scoring for one round, derived from primitives only (no GameState).
@@ -166,6 +182,7 @@ export function scorePlayerRound(
   //   Risky (2):  +2x if perfect, else flat -RISKY_MISS_PENALTY (forfeits partial credit)
   //   All-In (3): perfect DOUBLES the banked total; any miss wipes it to 0 (no streak bonus)
   //   Swap:       0 delta (swap handled separately), else flat -SWAP_MISS_PENALTY; no streak bonus
+  //   Shield:     scores identically to NO BET (its only effect is defensive — see scoreRound).
   let earned: number
   let swapFired = false
   if (bet === 'swap') {
@@ -209,6 +226,7 @@ export function scoreRound(
   const streakBonuses: Record<string, number> = {}
   const perfectRound: Record<string, boolean> = {}
   const executedSwaps: Array<{ winnerId: string; loserId: string }> = []
+  const blockedSwaps: Array<{ attackerId: string; defenderId: string }> = []
   // A player can be in at most one swap per round — prevents the leader's score being
   // duplicated to multiple attackers (which would inject points and break conservation).
   const swapInvolved = new Set<string>()
@@ -218,6 +236,10 @@ export function scoreRound(
   // Players who never locked in fall back to the full duration → minimum (floor) speed bonus.
   const fallbackLock = timerStart + timerDuration
 
+  // Pass 1 — score every player on their own guess. Swaps are resolved afterwards so a
+  // defender's perfect-round status is fully known regardless of player order (Shields need it).
+  const baseByPlayer: Record<string, number> = {}
+  const swapFiredBy = new Set<string>()
   for (const player of players) {
     const lockedAt = lockTimes[player.id] ?? fallbackLock
     const elapsed = Math.max(0, Math.min(timerDuration, lockedAt - timerStart))
@@ -233,26 +255,39 @@ export function scoreRound(
     perfectRound[player.id] = r.perfect
     streakBonuses[player.id] = r.streakBonus
     deltas[player.id] = r.delta
+    baseByPlayer[player.id] = r.base
+    if (r.swapFired) swapFiredBy.add(player.id)
+  }
 
-    if (r.swapFired) {
-      const targetId = swapTargets[player.id]
-      const target = targetId ? players.find((p) => p.id === targetId) : undefined
-      const targetAhead = !!target && preRoundScores[target.id] > preRoundScores[player.id]
-      if (targetAhead && !swapInvolved.has(player.id) && !swapInvolved.has(target!.id)) {
-        swapInvolved.add(player.id)
-        swapInvolved.add(target!.id)
-        executedSwaps.push({ winnerId: player.id, loserId: target!.id })
-      } else if (targetAhead) {
-        // Target valid, but this player or the target is already in a swap this round —
-        // this swap can't fire. The perfect swapper falls back to standard base points
-        // (no swap, no streak bonus, no penalty).
-        deltas[player.id] = r.base
-      }
-      // else: target not ahead / unset → silent miss, delta stays 0 (no penalty).
+  // Pass 2 — resolve Point Swaps (and Shield blocks) against fully-known perfect-round data.
+  for (const player of players) {
+    if (!swapFiredBy.has(player.id)) continue
+    const targetId = swapTargets[player.id]
+    const target = targetId ? players.find((p) => p.id === targetId) : undefined
+    if (!target) continue // no/unknown target → silent miss, delta stays 0 (no penalty)
+    const targetAhead = preRoundScores[target.id] > preRoundScores[player.id]
+    if (!targetAhead) continue // can only swap someone ahead → silent miss, delta stays 0
+
+    // Shield: a defender who bet Shield AND nailed the round bounces the swap back —
+    // the swap fails and the attacker eats the standard failed-swap penalty.
+    if (bets[target.id] === 'shield' && perfectRound[target.id]) {
+      deltas[player.id] = -SWAP_MISS_PENALTY
+      blockedSwaps.push({ attackerId: player.id, defenderId: target.id })
+      continue
+    }
+
+    if (!swapInvolved.has(player.id) && !swapInvolved.has(target.id)) {
+      swapInvolved.add(player.id)
+      swapInvolved.add(target.id)
+      executedSwaps.push({ winnerId: player.id, loserId: target.id })
+    } else {
+      // This player or the target is already in a swap this round — this swap can't fire.
+      // The perfect swapper falls back to standard base points (no swap, no penalty).
+      deltas[player.id] = baseByPlayer[player.id]
     }
   }
 
-  return { deltas, streakBonuses, perfectRound, executedSwaps }
+  return { deltas, streakBonuses, perfectRound, executedSwaps, blockedSwaps }
 }
 
 export function applyScoreDeltas(
@@ -307,16 +342,47 @@ export function aliveIds(lives: GameState['lives']): string[] {
   return Object.entries(lives).filter(([, n]) => n > 0).map(([id]) => id)
 }
 
-// Imperfect round = lose a life (floor 0). Already-eliminated players are untouched.
-export function applyLifeLoss(
+// Resolve one survival round (no points — lives are the only currency):
+//  • count each living player's wrong lines and apply the scaled life loss
+//  • track perfect-round streaks; a streak that lands on a multiple of SURVIVAL_STREAK_REGEN
+//    regenerates 1 life (capped at SURVIVAL_LIVES)
+//  • eliminated players (0 lives) are frozen and untouched
+export function resolveSurvivalRound(
   lives: GameState['lives'],
-  perfectRound: Record<string, boolean>
-): GameState['lives'] {
-  const next: GameState['lives'] = { ...lives }
-  for (const [id, n] of Object.entries(next)) {
-    if (n > 0 && !perfectRound[id]) next[id] = n - 1
-  }
-  return next
+  question: RoundQuestion,
+  guesses: GameState['guesses'],
+  players: Player[]
+): { lives: GameState['lives']; perfectRound: Record<string, boolean>; players: Player[]; lifeDeltas: Record<string, number> } {
+  const total = question.lines.length
+  const nextLives: GameState['lives'] = { ...lives }
+  const perfectRound: Record<string, boolean> = {}
+  const lifeDeltas: Record<string, number> = {}
+
+  const nextPlayers = players.map((p) => {
+    let wrong = 0
+    for (const line of question.lines) {
+      if (guesses[line.lineId]?.[p.id] !== question.correctAnswers[line.lineId]) wrong++
+    }
+    const perfect = total > 0 && wrong === 0
+    perfectRound[p.id] = perfect
+
+    // Eliminated players spectate — frozen lives, streak, and no delta.
+    if ((lives[p.id] ?? 0) <= 0) { lifeDeltas[p.id] = 0; return p }
+
+    const streak = perfect ? p.streak + 1 : 0
+    const before = nextLives[p.id] ?? 0
+    let life = before
+    if (!perfect) {
+      life = Math.max(0, before - survivalLifeLoss(total, wrong))
+    } else if (streak > 0 && streak % SURVIVAL_STREAK_REGEN === 0) {
+      life = Math.min(SURVIVAL_LIVES, before + 1) // hot-streak regen
+    }
+    nextLives[p.id] = life
+    lifeDeltas[p.id] = life - before
+    return { ...p, streak }
+  })
+
+  return { lives: nextLives, perfectRound, players: nextPlayers, lifeDeltas }
 }
 
 export function createInitialGameState(roomCode: string, totalRounds: number, speakers: Speaker[] = []): GameState {
@@ -324,6 +390,7 @@ export function createInitialGameState(roomCode: string, totalRounds: number, sp
     phase: 'lobby',
     mode: 'classic',
     drinking: false,
+    autoAdvance: false,
     roomCode,
     speakers,
     players: [],
@@ -343,9 +410,11 @@ export function createInitialGameState(roomCode: string, totalRounds: number, sp
     bets: {},
     swapTargets: {},
     executedSwaps: [],
+    blockedSwaps: [],
     rfClaim: null,
     rfVotes: {},
     lives: {},
+    lifeDeltas: {},
   }
 }
 
@@ -388,10 +457,10 @@ export function computeRfDrink(vote: 'real' | 'fake' | undefined, correct: boole
 
 export function drinkResultText(r: DrinkResult): string {
   switch (r.kind) {
-    case 'safe': return '😎 Safe — no drink!'
-    case 'sips': return `🥤 Take ${r.sips} sip${r.sips !== 1 ? 's' : ''}`
-    case 'shot': return '🥃 Whiffed it — take a SHOT!'
-    case 'afk': return `😴 AFK — ${r.sips} sips`
+    case 'safe': return 'Safe — no drink!'
+    case 'sips': return `Take ${r.sips} sip${r.sips !== 1 ? 's' : ''}`
+    case 'shot': return 'Whiffed it — take a SHOT!'
+    case 'afk': return `AFK — ${r.sips} sips`
   }
 }
 
@@ -400,10 +469,10 @@ export function roundDrinkCallouts(state: GameState): string[] {
   const out: string[] = []
   if (state.players.length === 0) return out
   const anyonePerfect = state.players.some((p) => state.perfectRound[p.id])
-  if (!anyonePerfect) out.push('🍻 Group drink — nobody nailed it. Everyone sips!')
+  if (!anyonePerfect) out.push('Group drink — nobody nailed it. Everyone sips!')
   for (const p of state.players) {
     if (state.perfectRound[p.id] && p.streak >= STREAK_DRINK_THRESHOLD) {
-      out.push(`🔥 ${p.name} is on a ${p.streak}-round streak — hand out ${p.streak} sips to anyone!`)
+      out.push(`${p.name} is on a ${p.streak}-round streak — hand out ${p.streak} sips to anyone!`)
     }
   }
   return out

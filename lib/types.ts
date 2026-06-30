@@ -62,13 +62,14 @@ export interface Player {
   streak: number // consecutive perfect rounds
 }
 
-// Confidence bet multiplier for a round (3 = All-In; 'swap' = Point Swap)
-export type Bet = 0.5 | 1 | 2 | 3 | 'swap'
+// Confidence bet multiplier for a round (3 = All-In; 'swap' = Point Swap; 'shield' = blocks incoming swaps)
+export type Bet = 0.5 | 1 | 2 | 3 | 'swap' | 'shield'
 
 export interface GameState {
   phase: GamePhase
   mode: GameMode
   drinking: boolean // Tipsy Edition overlay — stacks on any mode
+  autoAdvance: boolean // when true, the reveal screen auto-advances to the next round
   roomCode: string
   // Guessable speakers, loaded once by the host at game creation.
   // Players read this from broadcast state instead of querying the DB themselves.
@@ -93,11 +94,13 @@ export interface GameState {
   bets: Record<string, Bet> // playerId -> confidence bet this round (classic mode only)
   swapTargets: Record<string, string> // playerId -> targetPlayerId (only for 'swap' bet)
   executedSwaps: Array<{ winnerId: string; loserId: string }> // swaps that fired this round
+  blockedSwaps: Array<{ attackerId: string; defenderId: string }> // swaps a Shield blocked this round
   // --- Real or Cap mode ---
   rfClaim: RfClaim | null // this round's claim (null outside realfake mode)
   rfVotes: Record<string, 'real' | 'fake'> // playerId -> vote this round
   // --- Survival mode ---
   lives: Record<string, number> // playerId -> lives remaining (empty outside survival)
+  lifeDeltas: Record<string, number> // playerId -> life change applied this round (+regen / −loss)
 }
 
 // Messages sent over the Supabase Realtime channel

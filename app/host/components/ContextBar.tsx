@@ -11,7 +11,7 @@ export function ContextBar({ context, happenedAt, small }: { context: string | n
           {date}{ago && <span className="font-normal opacity-70"> ({ago})</span>}
         </span>
       )}
-      {context && <>📍 {context}</>}
+      {context && <>{context}</>}
     </div>
   )
 }

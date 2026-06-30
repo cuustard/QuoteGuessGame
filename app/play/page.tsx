@@ -14,6 +14,8 @@ import { burstConfetti } from '@/lib/confetti'
 import { loadPlayerSession, savePlayerSession } from '@/lib/session'
 import type { GameState, Bet, Speaker, ChannelMessage } from '@/lib/types'
 import { RealtimeChannel } from '@supabase/supabase-js'
+import { Avatar } from '@/app/components/Avatar'
+import { Hearts } from '@/app/components/Hearts'
 
 const CONNECT_TIMEOUT_MS = 6000
 const REACTION_EMOJIS = ['😂', '💀', '🤭', '🔥', '😳', '👏']
@@ -22,7 +24,7 @@ function PlayerController() {
   const params = useSearchParams()
   const roomCode = params.get('room')?.toUpperCase() ?? ''
   const playerName = params.get('name') ?? ''
-  const avatar = params.get('avatar') ?? '😎'
+  const avatar = params.get('avatar') ?? '' // retained for session compatibility; not displayed
   // Reuse the saved id when rejoining the same room+name so the host recognises us
   // as the exact same session (preserves answers, skips the duplicate-name guard).
   const [playerId] = useState(() => {
@@ -188,10 +190,9 @@ function PlayerController() {
     }
     const compute = () => {
       if (!q || !promptTypeRef.current) return 0
-      const claim = gameState?.rfClaim
-      const lines = gameState?.mode === 'realfake' && claim ? q.lines.filter((l) => l.lineId === claim.lineId) : q.lines
-      const contextDelay = (q.context ? `📍 ${q.context}`.length : 0) * TYPE_SPEED_MS
-      const quoteLen = lines.reduce((a, l) => a + l.lineText.length, 0)
+      // Whole quote types in every mode now (True or False shows full context).
+      const contextDelay = (q.context ? q.context.length : 0) * TYPE_SPEED_MS
+      const quoteLen = q.lines.reduce((a, l) => a + l.lineText.length, 0)
       const elapsed = Date.now() - promptTypeRef.current.start - contextDelay
       return Math.max(0, Math.min(quoteLen, Math.floor(elapsed / TYPE_SPEED_MS)))
     }
@@ -343,7 +344,7 @@ function PlayerController() {
   if (!gameState) {
     return (
       <main className="flex min-h-dvh items-center justify-center flex-col gap-4">
-        <div className="text-4xl animate-spin">⏳</div>
+        <div className="w-10 h-10 rounded-full animate-spin" style={{ border: '4px solid var(--surface)', borderTopColor: 'var(--primary)' }} />
         <p style={{ color: 'var(--muted)' }}>Connecting to room {roomCode}…</p>
       </main>
     )
@@ -366,14 +367,12 @@ function PlayerController() {
     .sort((a, b) => b.score - a.score)
 
   // Read-only label for the bet locked in during the prompt phase.
-  const betLabel = bet === 'swap' ? '🔀 Point Swap' : bet === 3 ? '💀 All-In' : bet === 2 ? '🔥 Risky ×2' : bet === 0.5 ? '🛡 Safe ×0.5' : '😐 No bet'
+  const betLabel = bet === 'swap' ? 'Point Swap' : bet === 'shield' ? '🛡 Shield' : bet === 3 ? 'All-In' : bet === 2 ? 'Risky ×2' : bet === 0.5 ? 'Safe ×0.5' : 'No bet'
 
-  // Confidence betting is available in classic and Real or Cap (survival's stakes are lives).
+  // Confidence betting is available in classic and True or False (survival's stakes are lives).
   const betsEnabled = gameState.mode === 'classic' || gameState.mode === 'realfake'
-  // Mode-derived: RF rounds show only the claimed line; survival tracks my lives.
-  const promptLines = gameState.mode === 'realfake' && gameState.rfClaim
-    ? (gameState.question?.lines ?? []).filter((l) => l.lineId === gameState.rfClaim!.lineId)
-    : gameState.question?.lines ?? []
+  // True or False now shows the WHOLE quote for context (the claimed name attaches to its line).
+  const promptLines = gameState.question?.lines ?? []
   const myLives = gameState.lives[playerId] ?? 0
   const amEliminated = gameState.mode === 'survival' && gameState.phase !== 'lobby' && myLives <= 0 && Object.keys(gameState.lives).length > 0
 
@@ -391,13 +390,15 @@ function PlayerController() {
     <main className="flex min-h-dvh flex-col p-4 pb-8 gap-4">
       {/* Mini header */}
       <div className="flex justify-between items-center">
-        <span className="font-black text-lg flex items-center gap-1" style={{ color: 'var(--primary-light)' }}>
-          <span>{avatar}</span>{playerName}
+        <span className="font-black text-lg flex items-center gap-2" style={{ color: 'var(--primary-light)' }}>
+          <Avatar name={playerName} id={playerId} size={28} />{playerName}
         </span>
         {gameState.phase !== 'lobby' && (
           <div className="text-sm flex items-center gap-2" style={{ color: 'var(--muted)' }}>
-            {myStreak > 1 && <span style={{ color: 'var(--accent)' }}>🔥{myStreak}</span>}
-            <span>{myScore} pts {myRank > 0 && `· #${myRank}`}</span>
+            {myStreak > 1 && <span style={{ color: 'var(--accent)' }}>streak {myStreak}</span>}
+            {gameState.mode === 'survival'
+              ? (myLives > 0 ? <Hearts n={myLives} /> : <span style={{ color: 'var(--incorrect)' }}>OUT</span>)
+              : <span>{myScore} pts {myRank > 0 && `· #${myRank}`}</span>}
           </div>
         )}
         <div className="rounded-lg px-3 py-1 font-mono font-bold text-sm" style={{ background: 'var(--surface)' }}>
@@ -408,22 +409,21 @@ function PlayerController() {
       {/* Lobby */}
       {gameState.phase === 'lobby' && (
         <div className="flex-1 flex flex-col items-center justify-center gap-4 animate-slide-up">
-          <div className="text-6xl">🎉</div>
           <h2 className="text-2xl font-black text-center">You&apos;re in!</h2>
           <div className="flex flex-wrap gap-2 justify-center">
             {gameState.mode === 'realfake' && (
               <div className="rounded-full px-4 py-1 text-sm font-black" style={{ background: 'var(--primary)', color: '#fff' }}>
-                🕵 Real or Cap — spot the fakes!
+                True or False — spot the fakes!
               </div>
             )}
             {gameState.mode === 'survival' && (
               <div className="rounded-full px-4 py-1 text-sm font-black" style={{ background: 'var(--incorrect)', color: '#fff' }}>
-                💀 Survival — 3 lives, last one standing
+                Survival — 3 lives, last one standing
               </div>
             )}
             {gameState.drinking && (
               <div className="rounded-full px-4 py-1 text-sm font-black" style={{ background: 'var(--accent)', color: '#000' }}>
-                🍺 Tipsy Edition — wrong = drink!
+                Tipsy Edition — wrong = drink!
               </div>
             )}
           </div>
@@ -432,12 +432,12 @@ function PlayerController() {
           </p>
           <div className="flex flex-wrap gap-2 justify-center mt-4">
             {gameState.players.map((p) => (
-              <div key={p.id} className="rounded-full px-4 py-1 text-sm font-bold flex items-center gap-1"
+              <div key={p.id} className="rounded-full px-4 py-1 text-sm font-bold flex items-center gap-2"
                 style={{
                   background: p.id === playerId ? 'var(--primary)' : 'var(--surface)',
                   color: p.id === playerId ? '#fff' : 'var(--text)',
                 }}>
-                <span>{p.avatar}</span>{p.name}{p.id === playerId ? ' (you)' : ''}
+                <Avatar name={p.name} id={p.id} size={20} />{p.name}{p.id === playerId ? ' (you)' : ''}
               </div>
             ))}
           </div>
@@ -448,13 +448,12 @@ function PlayerController() {
       {gameState.phase === 'prompt' && (
         <div className="flex-1 flex flex-col gap-4 animate-slide-up">
           <div className="text-center">
-            <div className="text-4xl animate-bounce">👀</div>
             <h2 className="text-2xl font-black mt-1">Round {gameState.currentRound}</h2>
           </div>
           {gameState.question?.context && (
             <div className="rounded-xl p-3 text-center italic text-sm w-full"
               style={{ background: 'var(--surface)', color: 'var(--muted)' }}>
-              📍 {gameState.question.context}
+              {gameState.question.context}
             </div>
           )}
 
@@ -466,14 +465,18 @@ function PlayerController() {
                 if (promptTyped <= startOffset) return null
                 const visible = Math.min(line.lineText.length, promptTyped - startOffset)
                 const typing = promptTyped < startOffset + line.lineText.length
+                // True or False: claimed line shows the claimed name; other lines stay context-only.
+                const label = gameState.mode === 'realfake' && gameState.rfClaim
+                  ? (line.lineId === gameState.rfClaim.lineId ? gameState.rfClaim.claimedSpeakerName : null)
+                  : '???'
                 return (
                   <div key={line.lineId} className="animate-slide-up">
                     {line.actionText && <p className="text-xs italic mb-0.5" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
                     <p className="leading-snug">
-                      <span className="font-black" style={{ color: gameState.mode === 'realfake' ? 'var(--accent)' : 'var(--primary-light)' }}>
-                        {gameState.mode === 'realfake' && gameState.rfClaim ? gameState.rfClaim.claimedSpeakerName : '???'}
-                      </span>{' '}
                       &ldquo;{line.lineText.slice(0, visible)}&rdquo;{typing && <span className="cursor-blink">▋</span>}
+                      {!typing && label !== null && (
+                        <span className="font-black" style={{ color: gameState.mode === 'realfake' ? 'var(--accent)' : 'var(--primary-light)' }}> — {label}</span>
+                      )}
                     </p>
                   </div>
                 )
@@ -482,13 +485,13 @@ function PlayerController() {
             </div>
           )}
 
-          {/* Real or Cap: the claim is the whole game — get ready to vote */}
+          {/* True or False: the claim is the whole game — get ready to vote */}
           {gameState.mode === 'realfake' && gameState.rfClaim && (
             <div className="rounded-2xl p-3 text-center" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
               <p className="font-black" style={{ color: 'var(--accent)' }}>
-                🕵 Did {gameState.rfClaim.claimedSpeakerName} really say this?
+                Did {gameState.rfClaim.claimedSpeakerName} really say it?
               </p>
-              <p className="text-xs mt-1" style={{ color: 'var(--muted)' }}>Place your bet, then vote REAL or CAP when voting opens.</p>
+              <p className="text-xs mt-1" style={{ color: 'var(--muted)' }}>Place your bet, then vote True or False when voting opens.</p>
             </div>
           )}
 
@@ -496,8 +499,8 @@ function PlayerController() {
           {gameState.mode === 'survival' && (
             <div className="rounded-2xl p-3 text-center" style={{ background: 'var(--surface)', border: '2px solid var(--incorrect)' }}>
               {amEliminated
-                ? <p className="font-black" style={{ color: 'var(--incorrect)' }}>💀 You&apos;re out — spectating</p>
-                : <p className="font-black">{'❤️'.repeat(myLives)} <span className="text-xs font-normal" style={{ color: 'var(--muted)' }}>miss a round, lose a life</span></p>}
+                ? <p className="font-black" style={{ color: 'var(--incorrect)' }}>You&apos;re out — spectating</p>
+                : <p className="font-black flex items-center justify-center gap-2"><Hearts n={myLives} /> <span className="text-xs font-normal" style={{ color: 'var(--muted)' }}>miss a round, lose a life</span></p>}
             </div>
           )}
 
@@ -514,7 +517,7 @@ function PlayerController() {
                 color: bet === 1 ? '#fff' : 'var(--text)',
                 border: bet === 1 ? '2px solid var(--primary-light)' : '2px solid transparent',
               }}>
-              😐 NO BET
+              NO BET
               <span className="block text-[10px] font-normal opacity-80 mt-0.5">Full points if you nail it — but <b>−100</b> if you&apos;re wrong</span>
             </button>
 
@@ -534,7 +537,7 @@ function PlayerController() {
                   color: bet === 0.5 ? '#fff' : 'var(--muted)',
                   border: '2px solid transparent',
                 }}>
-                🛡 Safe ×0.5
+                Safe ×0.5
               </button>
               <button onClick={() => chooseBet(2)}
                 className="rounded-xl py-2.5 px-1 text-sm font-bold leading-tight transition-all active:scale-95"
@@ -543,7 +546,7 @@ function PlayerController() {
                   color: bet === 2 ? '#fff' : 'var(--muted)',
                   border: '2px solid transparent',
                 }}>
-                🔥 Risky ×2
+                Risky ×2
               </button>
               {/* All-In — locked until the player banks the buy-in */}
               <button onClick={() => chooseBet(3)} disabled={myScore < ALLIN_MIN_BUYIN}
@@ -555,8 +558,19 @@ function PlayerController() {
                   opacity: myScore < ALLIN_MIN_BUYIN ? 0.45 : 1,
                   cursor: myScore < ALLIN_MIN_BUYIN ? 'not-allowed' : 'pointer',
                 }}>
-                💀 All-In — Double or Nothing
+                All-In — Double or Nothing
                 {myScore < ALLIN_MIN_BUYIN && <span className="block text-[10px] font-normal mt-0.5">(Requires 1,000 pts)</span>}
+              </button>
+              {/* Shield — defensive: blocks incoming Point Swaps. Always available (the leader needs it most). */}
+              <button onClick={() => chooseBet('shield')}
+                className="col-span-2 rounded-xl py-2.5 px-1 text-sm font-bold leading-tight transition-all active:scale-95"
+                style={{
+                  background: bet === 'shield' ? '#2563eb' : 'rgba(255,255,255,0.07)',
+                  color: bet === 'shield' ? '#fff' : 'var(--text)',
+                  border: bet === 'shield' ? '2px solid #60a5fa' : '2px solid transparent',
+                }}>
+                🛡 Shield
+                <span className="block text-[10px] font-normal opacity-80 mt-0.5">Blocks incoming Swaps (1× points)</span>
               </button>
               {/* Point Swap — only shown when someone is ahead; locked until the buy-in is banked */}
               {swapTargets.length > 0 && (
@@ -569,7 +583,7 @@ function PlayerController() {
                     opacity: myScore < SWAP_MIN_BUYIN ? 0.45 : 1,
                     cursor: myScore < SWAP_MIN_BUYIN ? 'not-allowed' : 'pointer',
                   }}>
-                  🔀 Point Swap
+                  Point Swap
                   {myScore < SWAP_MIN_BUYIN && <span className="block text-[10px] font-normal mt-0.5">(Requires 500 pts)</span>}
                 </button>
               )}
@@ -578,8 +592,9 @@ function PlayerController() {
             {/* Selected-bet explainer */}
             {bet === 0.5 && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Half the points you earn — but <b>zero risk</b>. A safe hedge.</p>}
             {bet === 2 && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Nail it to win <b>×2</b> — get it wrong and you lose <b style={{ color: 'var(--incorrect)' }}>500</b>.</p>}
-            {bet === 3 && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Nail it = <b style={{ color: 'var(--correct)' }}>DOUBLE your total score</b>. Wrong = <b style={{ color: 'var(--incorrect)' }}>lose EVERYTHING</b>. 💀</p>}
+            {bet === 3 && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Nail it = <b style={{ color: 'var(--correct)' }}>DOUBLE your total score</b>. Wrong = <b style={{ color: 'var(--incorrect)' }}>lose EVERYTHING</b>.</p>}
             {bet === 'swap' && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Nail it = steal their score. Wrong and you lose <b style={{ color: 'var(--incorrect)' }}>750 pts</b>.</p>}
+            {bet === 'shield' && <p className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>Same points as NO BET — and if you <b>nail the round</b>, any Point Swap aimed at you <b style={{ color: '#60a5fa' }}>bounces back</b> (the attacker loses 750).</p>}
           </div>
           )}
 
@@ -596,7 +611,7 @@ function PlayerController() {
                       color: swapTarget === t.id ? '#000' : 'var(--text)',
                       border: swapTarget === t.id ? '2px solid var(--accent)' : '2px solid transparent',
                     }}>
-                    <span>{t.avatar} {t.name}</span>
+                    <span className="flex items-center gap-2"><Avatar name={t.name} id={t.id} size={22} />{t.name}</span>
                     <span className="font-black tabular-nums">{t.score} pts</span>
                   </button>
                 ))}
@@ -615,19 +630,39 @@ function PlayerController() {
             <p className="text-xs" style={{ color: 'var(--muted)' }}>
               {gameState.mode === 'classic' && 'Lock in a bet — guessing opens when the timer hits zero'}
               {gameState.mode === 'realfake' && 'Lock in a bet — voting opens when the timer hits zero'}
-              {gameState.mode === 'survival' && (amEliminated ? 'Watch the chaos unfold 🍿' : 'Get it right or lose a life — guessing opens soon')}
+              {gameState.mode === 'survival' && (amEliminated ? 'Watch the chaos unfold' : 'Get it right or lose a life — guessing opens soon')}
             </p>
           </div>
         </div>
       )}
 
-      {/* Guessing Phase — Real or Cap: one quote, two buttons */}
+      {/* Guessing Phase — True or False: full quote, two buttons */}
       {gameState.phase === 'guessing' && gameState.mode === 'realfake' && gameState.question && gameState.rfClaim && (
         <div className="flex-1 flex flex-col gap-4 animate-slide-up">
-          <div className="rounded-2xl p-4" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
-            <p className="leading-snug">
-              <span className="font-black" style={{ color: 'var(--accent)' }}>{gameState.rfClaim.claimedSpeakerName}</span>{' '}
-              &ldquo;{promptLines[0]?.lineText}&rdquo;
+          <div className="rounded-2xl p-4" style={{ background: 'var(--surface)' }}>
+            {promptLines.length > 1 && (
+              <p className="text-[10px] uppercase tracking-widest mb-2 text-center" style={{ color: 'var(--muted)' }}>Only judge the highlighted line</p>
+            )}
+            <div className="space-y-2">
+              {promptLines.map((line) => {
+                const isClaim = line.lineId === gameState.rfClaim!.lineId
+                return (
+                  <div key={line.lineId} className="rounded-xl px-3 py-2 transition-all"
+                    style={{
+                      background: isClaim ? 'rgba(245,158,11,0.15)' : 'transparent',
+                      border: isClaim ? '2px solid var(--accent)' : '2px solid transparent',
+                      opacity: isClaim ? 1 : 0.5,
+                    }}>
+                    <p className="leading-snug text-sm">
+                      &ldquo;{line.lineText}&rdquo;
+                      {isClaim && <span className="font-black block mt-1" style={{ color: 'var(--accent)' }}>— {gameState.rfClaim!.claimedSpeakerName}?</span>}
+                    </p>
+                  </div>
+                )
+              })}
+            </div>
+            <p className="text-sm font-black text-center pt-2" style={{ color: 'var(--accent)' }}>
+              Did {gameState.rfClaim!.claimedSpeakerName} really say {promptLines.length > 1 ? 'the highlighted line' : 'it'}?
             </p>
           </div>
           <div className="rounded-xl px-3 py-2 flex items-center justify-center gap-2 text-xs" style={{ background: 'var(--surface)' }}>
@@ -640,19 +675,19 @@ function PlayerController() {
           {!rfVote ? (
             <div className="grid grid-cols-2 gap-3 flex-1 max-h-72">
               <button onClick={() => voteRf('real')}
-                className="rounded-2xl text-3xl font-black transition-all active:scale-95"
+                className="rounded-2xl text-4xl font-black transition-all active:scale-95"
                 style={{ background: 'var(--correct)', color: '#fff' }}>
-                ✅<br />REAL
+                TRUE
               </button>
               <button onClick={() => voteRf('fake')}
-                className="rounded-2xl text-3xl font-black transition-all active:scale-95"
+                className="rounded-2xl text-4xl font-black transition-all active:scale-95"
                 style={{ background: 'var(--incorrect)', color: '#fff' }}>
-                🧢<br />CAP
+                FALSE
               </button>
             </div>
           ) : (
             <div className="text-center rounded-2xl py-6 font-black text-lg" style={{ background: 'var(--surface)', color: 'var(--correct)' }}>
-              ✓ Voted {rfVote === 'real' ? '✅ REAL' : '🧢 CAP'} — waiting for others…
+              Voted {rfVote === 'real' ? 'TRUE' : 'FALSE'} — waiting for others…
             </div>
           )}
           <div className="flex justify-center gap-2 mt-auto">
@@ -670,8 +705,7 @@ function PlayerController() {
       {/* Guessing Phase — Survival spectator (eliminated) */}
       {gameState.phase === 'guessing' && gameState.mode === 'survival' && amEliminated && (
         <div className="flex-1 flex flex-col items-center justify-center gap-4 animate-slide-up">
-          <div className="text-6xl">💀</div>
-          <p className="text-xl font-black">You&apos;re out!</p>
+          <p className="text-3xl font-black" style={{ color: 'var(--incorrect)' }}>You&apos;re out!</p>
           <p className="text-sm text-center" style={{ color: 'var(--muted)' }}>Spectate, heckle, and fire reactions at the survivors.</p>
           <div className="flex justify-center gap-2">
             {REACTION_EMOJIS.map((e) => (
@@ -755,8 +789,8 @@ function PlayerController() {
               )}
               {/* Survival: lives reminder */}
               {gameState.mode === 'survival' && (
-                <div className="rounded-xl px-3 py-2 text-center text-xs font-bold" style={{ background: 'var(--surface)' }}>
-                  {'❤️'.repeat(myLives)} <span style={{ color: 'var(--muted)' }}>— a single wrong line costs a life</span>
+                <div className="rounded-xl px-3 py-2 text-center text-xs font-bold flex items-center justify-center gap-2" style={{ background: 'var(--surface)' }}>
+                  <Hearts n={myLives} /> <span style={{ color: 'var(--muted)' }}>— a wrong line costs a life</span>
                 </div>
               )}
 
@@ -771,7 +805,7 @@ function PlayerController() {
             </>
           ) : (
             <div className="text-center rounded-2xl py-4 font-black text-lg" style={{ background: 'var(--surface)', color: 'var(--correct)' }}>
-              ✓ Locked in! Waiting for others…
+              Locked in! Waiting for others…
             </div>
           )}
 
@@ -788,7 +822,7 @@ function PlayerController() {
         </div>
       )}
 
-      {/* Reveal Phase — Real or Cap verdict */}
+      {/* Reveal Phase — True or False verdict (colour reflects whether YOU were right) */}
       {gameState.phase === 'reveal' && gameState.mode === 'realfake' && gameState.rfClaim && (() => {
         const right = gameState.perfectRound[playerId] === true
         const truthName = gameState.question?.lines.find((l) => l.lineId === gameState.rfClaim!.lineId)?.speakerName ?? '???'
@@ -796,13 +830,13 @@ function PlayerController() {
           <div className="flex-1 flex flex-col gap-4 animate-slide-up">
             <h2 className="text-2xl font-black text-center">Results</h2>
             <div className="rounded-2xl p-5 text-center space-y-2"
-              style={{ background: 'var(--surface)', border: `2px solid ${gameState.rfClaim.isReal ? 'var(--correct)' : 'var(--incorrect)'}` }}>
-              <p className="text-3xl font-black" style={{ color: gameState.rfClaim.isReal ? 'var(--correct)' : 'var(--incorrect)' }}>
-                {gameState.rfClaim.isReal ? '✅ It was REAL' : '🧢 It was CAP'}
+              style={{ background: 'var(--surface)', border: `2px solid ${right ? 'var(--correct)' : 'var(--incorrect)'}` }}>
+              <p className="text-3xl font-black" style={{ color: right ? 'var(--correct)' : 'var(--incorrect)' }}>
+                {rfVote === null ? 'No vote' : right ? 'Correct!' : 'Incorrect'}
               </p>
-              {!gameState.rfClaim.isReal && <p className="text-sm" style={{ color: 'var(--muted)' }}>It was actually <b style={{ color: 'var(--text)' }}>{truthName}</b></p>}
-              <p className="text-lg font-bold" style={{ color: right ? 'var(--correct)' : 'var(--incorrect)' }}>
-                {rfVote === null ? '😴 You didn’t vote' : right ? 'You called it! 🎯' : 'You got played 💀'}
+              <p className="text-lg font-bold" style={{ color: 'var(--text)' }}>
+                It was {gameState.rfClaim.isReal ? 'TRUE' : 'FALSE'}
+                {!gameState.rfClaim.isReal && <span style={{ color: 'var(--muted)' }} className="font-normal"> — actually {truthName}</span>}
               </p>
               {(() => {
                 const delta = gameState.scores[playerId] ?? 0
@@ -812,7 +846,7 @@ function PlayerController() {
                     {delta >= 0 ? '+' : ''}{delta} this round
                     {(usedBet === 0.5 || usedBet === 2) && <span style={{ color: 'var(--muted)' }}> · ×{usedBet} bet</span>}
                     {usedBet === 3 && <span style={{ color: 'var(--muted)' }}> · all-in</span>}
-                    {usedBet === 'swap' && <span style={{ color: 'var(--muted)' }}> · 🔀 swap</span>}
+                    {usedBet === 'swap' && <span style={{ color: 'var(--muted)' }}> · swap</span>}
                   </p>
                 )
               })()}
@@ -837,11 +871,16 @@ function PlayerController() {
       {gameState.phase === 'reveal' && gameState.mode !== 'realfake' && gameState.question && (
         <div className="flex-1 flex flex-col gap-4 animate-slide-up">
           <h2 className="text-2xl font-black text-center">Results</h2>
-          {gameState.mode === 'survival' && (
-            <div className="rounded-2xl p-3 text-center font-black" style={{ background: 'var(--surface)', border: '2px solid var(--incorrect)' }}>
-              {myLives > 0 ? <>{'❤️'.repeat(myLives)} {gameState.perfectRound[playerId] === false && <span style={{ color: 'var(--incorrect)' }}>−1 life!</span>}</> : <span style={{ color: 'var(--incorrect)' }}>💀 ELIMINATED</span>}
-            </div>
-          )}
+          {gameState.mode === 'survival' && (() => {
+            const d = gameState.lifeDeltas[playerId] ?? 0
+            return (
+              <div className="rounded-2xl p-3 text-center font-black flex items-center justify-center gap-2" style={{ background: 'var(--surface)', border: '2px solid var(--incorrect)' }}>
+                {myLives > 0 ? <Hearts n={myLives} /> : <span style={{ color: 'var(--incorrect)' }}>ELIMINATED</span>}
+                {d < 0 && <span style={{ color: 'var(--incorrect)' }}>{d} life</span>}
+                {d > 0 && <span style={{ color: 'var(--correct)' }}>+{d} life!</span>}
+              </div>
+            )
+          })()}
           <div className="space-y-3">
             {gameState.question.lines.map((line) => {
               const myGuess = myGuesses[line.lineId]
@@ -855,7 +894,10 @@ function PlayerController() {
                     border: `2px solid ${isCorrect ? 'var(--correct)' : 'var(--incorrect)'}`,
                   }}>
                   <div className="flex items-center gap-3">
-                    <span className="text-2xl">{isCorrect ? '✅' : '❌'}</span>
+                    <span className="text-xs font-black uppercase tracking-wide px-2 py-1 rounded shrink-0"
+                      style={{ background: isCorrect ? 'var(--correct)' : 'var(--incorrect)', color: '#fff' }}>
+                      {isCorrect ? 'Correct' : 'Incorrect'}
+                    </span>
                     <div className="flex-1">
                       <p className="font-bold" style={{ color: isCorrect ? 'var(--correct)' : 'var(--incorrect)' }}>
                         {guessSpeaker?.name ?? '—'}
@@ -887,6 +929,7 @@ function PlayerController() {
             )
           })()}
 
+          {gameState.mode !== 'survival' && (
           <div className="rounded-2xl p-4 text-center" style={{ background: 'var(--surface)' }}>
             <p className="text-xs uppercase tracking-widest mb-1" style={{ color: 'var(--muted)' }}>Your score</p>
             {(() => {
@@ -903,6 +946,7 @@ function PlayerController() {
             })()}
             {myRank > 0 && <p className="text-sm mt-1" style={{ color: 'var(--muted)' }}>#{myRank} of {gameState.players.length}</p>}
           </div>
+          )}
           <p className="text-center text-sm animate-pulse" style={{ color: 'var(--muted)' }}>
             Waiting for host…
           </p>
@@ -920,27 +964,29 @@ function PlayerController() {
         const amLast = gameState.drinking && ranked.length > 1 && ranked[ranked.length - 1].id === playerId
         return (
         <div className="flex-1 flex flex-col items-center justify-center gap-6 animate-bounce-in">
-          <div className="text-6xl">{myPos === 1 ? '🏆' : myPos === 2 ? '🥈' : myPos === 3 ? '🥉' : amEliminated ? '💀' : '🎮'}</div>
-          <h2 className="text-3xl font-black">
+          <h2 className="text-4xl font-black">
             {myPos === 1 ? (gameState.mode === 'survival' ? 'You survived!' : 'You won!') : `#${myPos} place`}
           </h2>
           {amLast && (
             <div className="rounded-full px-5 py-2 text-sm font-black" style={{ background: 'var(--incorrect)', color: '#fff' }}>
-              🏴 Finish your drink!
+              Finish your drink!
             </div>
           )}
           <div className="w-full space-y-2">
-            {ranked.map((p, i) => (
+            {ranked.map((p, i) => {
+              const lives = gameState.lives[p.id] ?? 0
+              return (
                 <div key={p.id}
                   className="flex justify-between items-center rounded-xl px-5 py-3"
                   style={{
                     background: p.id === playerId ? 'var(--primary)' : 'var(--surface)',
                     fontWeight: p.id === playerId ? 900 : 400,
                   }}>
-                  <span className="flex items-center gap-1">{['🥇', '🥈', '🥉'][i] ?? `${i + 1}.`} <span>{p.avatar}</span> {p.name}</span>
-                  <span className="font-black">{gameState.mode === 'survival' ? ('❤️'.repeat(gameState.lives[p.id] ?? 0) || '💀') : p.score}</span>
+                  <span className="flex items-center gap-2"><span className="font-bold opacity-70">{i + 1}.</span> <Avatar name={p.name} id={p.id} size={22} /> {p.name}</span>
+                  <span className="font-black">{gameState.mode === 'survival' ? (lives > 0 ? <Hearts n={lives} /> : 'OUT') : p.score}</span>
                 </div>
-              ))}
+              )
+            })}
           </div>
           <p className="text-center text-sm animate-pulse" style={{ color: 'var(--muted)' }}>
             Keep this open — the host can start another game and you&apos;ll jump straight back in.

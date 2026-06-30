@@ -12,10 +12,13 @@ interface TypewriterProps {
   // plain=true: renders bare text with no card/??? wrapper (used for context strings)
   plain?: boolean
   plainClassName?: string
+  // Per-line speaker attribution shown after a finished line. Returns a name to attach,
+  // or null to attach nothing. When the prop is omitted, every line shows "???".
+  speakerLabel?: (lineId: number) => string | null
 }
 
 // Types the quote out character-by-character. Keyed by conversationId so it remounts each round.
-export function Typewriter({ lines, onComplete, plain, plainClassName }: TypewriterProps) {
+export function Typewriter({ lines, onComplete, plain, plainClassName, speakerLabel }: TypewriterProps) {
   const total = lines.reduce((a, l) => a + l.lineText.length, 0)
   const [shown, setShown] = useState(0)
 
@@ -55,12 +58,15 @@ export function Typewriter({ lines, onComplete, plain, plainClassName }: Typewri
         if (!reached) return null
         const visible = Math.min(line.lineText.length, shown - start)
         const typing = shown < start + line.lineText.length
+        // Default behaviour: every finished line shows "???". When a speakerLabel fn is given,
+        // a returned name is attached and a null leaves the line unattributed (True/False context).
+        const label = speakerLabel ? speakerLabel(line.lineId) : '???'
         return (
           <div key={line.lineId} className="rounded-2xl p-8 space-y-1 animate-slide-up" style={{ background: 'var(--surface)' }}>
             {line.actionText && <p className="text-xl italic" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
             <p className="text-4xl leading-snug">
               &ldquo;{line.lineText.slice(0, visible)}&rdquo;{typing && <span className="cursor-blink">▋</span>}{' '}
-              {!typing && <span className="text-2xl font-bold" style={{ color: 'var(--primary-light)' }}>— ???</span>}
+              {!typing && label !== null && <span className="text-2xl font-bold" style={{ color: 'var(--primary-light)' }}>— {label}</span>}
             </p>
           </div>
         )

@@ -8,8 +8,8 @@ import {
   generateRoomCode, fetchSpeakers, fetchRandomConversation,
   buildRoundQuestion, scoreRound, applyScoreDeltas, createInitialGameState,
   computeRoundDrinks, computeRfDrink, drinkResultText, roundDrinkCallouts,
-  buildRfClaim, applyLifeLoss, aliveIds, SURVIVAL_LIVES, survivalTimerMs,
-  TIMER_DURATION_MS,
+  buildRfClaim, resolveSurvivalRound, aliveIds, SURVIVAL_LIVES, survivalTimerMs,
+  TIMER_DURATION_MS, REVEAL_DURATION_MS,
 } from '@/lib/game'
 import { unlockAudio, playTick, playReveal } from '@/lib/sounds'
 import type { GameState, GameMode, Player, RoundQuestion, ChannelMessage } from '@/lib/types'
@@ -22,6 +22,8 @@ import { JoinQR } from './components/JoinQR'
 import { LiveLeaderboard } from './components/LiveLeaderboard'
 import { TimerBar } from './components/TimerBar'
 import { TVScaleWrapper } from './components/TVScaleWrapper'
+import { Avatar } from '../components/Avatar'
+import { Hearts } from '../components/Hearts'
 
 const ROUND_OPTIONS = [5, 10, 15, 20]
 const TIMER_OPTIONS_SEC = [10, 20, 30]
@@ -44,6 +46,7 @@ export default function HostPage() {
   const [presentIds, setPresentIds] = useState<Set<string>>(new Set())
   const [presenceReady, setPresenceReady] = useState(false)
   const [promptCountdown, setPromptCountdown] = useState<number | null>(null)
+  const [revealCountdown, setRevealCountdown] = useState<number | null>(null)
   // Tracks which conversationId's context has finished typing, so the quote only starts after.
   const [contextDoneForConv, setContextDoneForConv] = useState<number | null>(null)
 
@@ -139,38 +142,31 @@ export default function HostPage() {
       const syntheticGuesses: GameState['guesses'] = {
         [lid]: Object.fromEntries(cur.players.map((p) => [p.id, cur.rfVotes[p.id] === truth ? CORRECT : 0])),
       }
-      const { deltas, streakBonuses, perfectRound, executedSwaps } = scoreRound(syntheticQ, syntheticGuesses, cur.players, cur.timerStart ?? Date.now(), cur.timerDuration, cur.lockTimes, cur.bets, cur.swapTargets)
+      const { deltas, streakBonuses, perfectRound, executedSwaps, blockedSwaps } = scoreRound(syntheticQ, syntheticGuesses, cur.players, cur.timerStart ?? Date.now(), cur.timerDuration, cur.lockTimes, cur.bets, cur.swapTargets)
       const updatedPlayers = applyScoreDeltas(cur.players, deltas, perfectRound, executedSwaps)
       broadcast({
         ...cur, phase: 'reveal', revealedAnswers, question: questionWithNames,
-        scores: deltas, streakBonuses, perfectRound, executedSwaps, players: updatedPlayers,
+        scores: deltas, streakBonuses, perfectRound, executedSwaps, blockedSwaps, players: updatedPlayers,
       })
       return
     }
 
-    // Classic & Survival share line-guess scoring; survival has no bets/swaps (lives are the stakes).
-    const bets = cur.mode === 'survival' ? {} : cur.bets
-    const swapTargets = cur.mode === 'survival' ? {} : cur.swapTargets
-    const { deltas, streakBonuses, perfectRound, executedSwaps } = scoreRound(cur.question, cur.guesses, cur.players, cur.timerStart ?? Date.now(), cur.timerDuration, cur.lockTimes, bets, swapTargets)
-
+    // Survival has NO points — lives are the only currency. Scaled life loss + hot-streak regen.
     if (cur.mode === 'survival') {
-      // Eliminated players spectate: scores frozen, no further life loss (applyLifeLoss floors at 0).
-      for (const p of cur.players) {
-        if ((cur.lives[p.id] ?? 0) <= 0) { deltas[p.id] = 0; streakBonuses[p.id] = 0 }
-      }
-      const lives = applyLifeLoss(cur.lives, perfectRound)
-      const updatedPlayers = applyScoreDeltas(cur.players, deltas, perfectRound, [])
+      const { lives, perfectRound, players, lifeDeltas } = resolveSurvivalRound(cur.lives, cur.question, cur.guesses, cur.players)
       broadcast({
         ...cur, phase: 'reveal', revealedAnswers, question: questionWithNames,
-        scores: deltas, streakBonuses, perfectRound, executedSwaps: [], players: updatedPlayers, lives,
+        scores: {}, streakBonuses: {}, perfectRound, executedSwaps: [], blockedSwaps: [], players, lives, lifeDeltas,
       })
       return
     }
 
+    // Classic guessing scoring (bets/swaps/streaks).
+    const { deltas, streakBonuses, perfectRound, executedSwaps, blockedSwaps } = scoreRound(cur.question, cur.guesses, cur.players, cur.timerStart ?? Date.now(), cur.timerDuration, cur.lockTimes, cur.bets, cur.swapTargets)
     const updatedPlayers = applyScoreDeltas(cur.players, deltas, perfectRound, executedSwaps)
     broadcast({
       ...cur, phase: 'reveal', revealedAnswers, question: questionWithNames,
-      scores: deltas, streakBonuses, perfectRound, executedSwaps, players: updatedPlayers,
+      scores: deltas, streakBonuses, perfectRound, executedSwaps, blockedSwaps, players: updatedPlayers,
     })
   }, [broadcast])
 
@@ -349,11 +345,14 @@ export default function HostPage() {
       speakers: spkrs,
       mode,
       drinking: resumable.state.drinking ?? legacyMode === 'drinking',
+      autoAdvance: resumable.state.autoAdvance ?? false,
       survivalBaseTimer,
       timerDuration: survivalBaseTimer,
+      blockedSwaps: resumable.state.blockedSwaps ?? [],
       rfClaim: resumable.state.rfClaim ?? null,
       rfVotes: resumable.state.rfVotes ?? {},
       lives: resumable.state.lives ?? {},
+      lifeDeltas: resumable.state.lifeDeltas ?? {},
       lockTimes: resumable.state.lockTimes ?? {},
     }
     try {
@@ -390,6 +389,12 @@ export default function HostPage() {
     broadcast({ ...cur, drinking })
   }
 
+  function setAutoAdvance(autoAdvance: boolean) {
+    const cur = stateRef.current
+    if (!cur || cur.phase !== 'lobby') return
+    broadcast({ ...cur, autoAdvance })
+  }
+
   // advance=false re-rolls the current round (used by Skip)
   async function startNextRound(advance = true) {
     const cur = stateRef.current
@@ -415,10 +420,8 @@ export default function HostPage() {
       ? survivalTimerMs(cur.survivalBaseTimer, nextRound)
       : cur.timerDuration
     const contextChars = question.context?.length ?? 0
-    const quoteChars = (cur.mode === 'realfake' && rfClaim
-      ? question.lines.filter((l) => l.lineId === rfClaim.lineId)
-      : question.lines
-    ).reduce((a, l) => a + l.lineText.length, 0)
+    // True or False now shows the whole multi-part quote, so time it against every line.
+    const quoteChars = question.lines.reduce((a, l) => a + l.lineText.length, 0)
     const promptMs = Math.min(PROMPT_MAX_MS, Math.max(PROMPT_MIN_MS, (contextChars + quoteChars) * TYPE_SPEED_MS + PROMPT_BUFFER_MS))
     // eslint-disable-next-line react-hooks/purity -- event-driven, not a render path
     const promptEnd = Date.now() + promptMs
@@ -428,8 +431,8 @@ export default function HostPage() {
       currentRound: nextRound,
       promptEnd,
       timerDuration,
-      question, guesses: {}, lockTimes: {}, timerStart: null, revealedAnswers: {}, scores: {}, streakBonuses: {}, perfectRound: {}, bets: {}, swapTargets: {}, executedSwaps: [],
-      rfClaim, rfVotes: {}, lives,
+      question, guesses: {}, lockTimes: {}, timerStart: null, revealedAnswers: {}, scores: {}, streakBonuses: {}, perfectRound: {}, bets: {}, swapTargets: {}, executedSwaps: [], blockedSwaps: [],
+      rfClaim, rfVotes: {}, lives, lifeDeltas: {},
     }
     setTimeLeft(nextState.timerDuration)
     broadcast(nextState)
@@ -522,6 +525,21 @@ export default function HostPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state?.phase, state?.question?.conversationId])
 
+  // Auto-advance: when enabled, the reveal screen counts down and rolls to the next round itself.
+  useEffect(() => {
+    if (state?.phase !== 'reveal' || !state.autoAdvance) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setRevealCountdown(null)
+      return
+    }
+    const end = Date.now() + REVEAL_DURATION_MS
+    setRevealCountdown(Math.ceil(REVEAL_DURATION_MS / 1000))
+    const iv = setInterval(() => setRevealCountdown(Math.max(0, Math.ceil((end - Date.now()) / 1000))), 250)
+    const to = setTimeout(() => continueAfterReveal(), REVEAL_DURATION_MS)
+    return () => { clearInterval(iv); clearTimeout(to) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state?.phase, state?.autoAdvance, state?.question?.conversationId])
+
   useEffect(() => {
     const active = state?.phase === 'prompt' && !!state.promptEnd
     const secsLeft = () => Math.max(0, Math.ceil((state!.promptEnd! - Date.now()) / 1000))
@@ -545,8 +563,7 @@ export default function HostPage() {
       <TVScaleWrapper>
       <main className="flex min-h-dvh items-center justify-center flex-col gap-8" style={{ width: '1920px', height: '1080px' }}>
         <div className="text-center space-y-4">
-          <div className="text-8xl">🎤</div>
-          <h1 className="text-5xl font-black" style={{ color: 'var(--primary-light)' }}>Who Said It?</h1>
+          <h1 className="text-6xl font-black" style={{ color: 'var(--primary-light)' }}>Who Said It?</h1>
           <p className="text-lg" style={{ color: 'var(--muted)' }}>Host Screen — display this on the TV</p>
         </div>
         <button onClick={createGame}
@@ -558,7 +575,7 @@ export default function HostPage() {
           <button onClick={resumeGame}
             className="rounded-2xl px-8 py-3 text-lg font-bold transition-all hover:scale-105"
             style={{ background: 'var(--surface)', border: '2px solid var(--accent)', color: 'var(--accent)' }}>
-            ↻ Resume game {resumable.state.roomCode} (round {resumable.state.currentRound}/{resumable.state.totalRounds})
+            Resume game {resumable.state.roomCode} (round {resumable.state.currentRound}/{resumable.state.totalRounds})
           </button>
         )}
       </main>
@@ -573,9 +590,9 @@ export default function HostPage() {
     <main className="p-8 flex flex-col gap-6" style={{ width: '1920px', height: '1080px', overflow: 'hidden' }}>
       {/* Header */}
       <div className="flex items-center justify-between gap-2 flex-wrap">
-        <div className="text-4xl font-black flex items-center gap-2" style={{ color: 'var(--primary-light)' }}>
+        <div className="text-4xl font-black flex items-center gap-3" style={{ color: 'var(--primary-light)' }}>
           Who Said It?
-          {state.drinking && <span className="text-2xl" title="Tipsy Edition">🍺</span>}
+          {state.drinking && <span className="text-lg font-bold rounded-md px-2 py-0.5" style={{ background: 'var(--accent)', color: '#000' }}>TIPSY</span>}
         </div>
         <div className="flex items-center gap-5 sm:gap-8">
           {state.phase !== 'lobby' && state.phase !== 'leaderboard' && (
@@ -587,7 +604,7 @@ export default function HostPage() {
             <button onClick={skipRound}
               className="rounded-lg px-5 py-2.5 text-xl font-bold transition-all hover:scale-105"
               style={{ background: 'var(--surface)', color: 'var(--muted)' }}>
-              Skip ⏭
+              Skip
             </button>
           )}
           <div className="rounded-xl px-5 py-3 text-4xl font-black tracking-widest" style={{ background: 'var(--surface)' }}>
@@ -622,7 +639,7 @@ export default function HostPage() {
                     return (
                       <div key={p.id} className="rounded-full px-4 py-2 text-xl font-bold animate-bounce-in flex items-center gap-2"
                         style={{ background: 'var(--surface)', border: `2px solid ${off ? 'var(--muted)' : 'var(--primary)'}`, opacity: off ? 0.5 : 1 }}>
-                        <span>{p.avatar}</span>{p.name}{off && <span title="disconnected">📴</span>}
+                        <Avatar name={p.name} id={p.id} size={26} />{p.name}{off && <span className="text-sm" style={{ color: 'var(--muted)' }}>(away)</span>}
                       </div>
                     )
                   })}
@@ -648,7 +665,7 @@ export default function HostPage() {
                   className="rounded-lg px-5 py-2.5 text-xl font-bold transition-all"
                   style={{ background: state.timerDuration === s * 1000 ? 'var(--primary)' : 'var(--surface)', color: state.timerDuration === s * 1000 ? '#fff' : 'var(--muted)' }}>{s}s</button>
               ))}
-              {state.mode === 'survival' && <span className="text-sm" style={{ color: 'var(--muted)' }}>shrinks each round ⚡</span>}
+              {state.mode === 'survival' && <span className="text-sm" style={{ color: 'var(--muted)' }}>shrinks each round</span>}
             </div>
 
             {/* Mode */}
@@ -657,9 +674,9 @@ export default function HostPage() {
               <div className="flex-1 space-y-2">
                 <div className="flex gap-2">
                   {([
-                    { m: 'classic' as GameMode, label: '🏆 Classic' },
-                    { m: 'realfake' as GameMode, label: '🕵 Real or Cap' },
-                    { m: 'survival' as GameMode, label: '💀 Survival' },
+                    { m: 'classic' as GameMode, label: 'Classic' },
+                    { m: 'realfake' as GameMode, label: 'True or False' },
+                    { m: 'survival' as GameMode, label: 'Survival' },
                   ]).map(({ m, label }) => (
                     <button key={m} onClick={() => setMode(m)}
                       className="rounded-lg px-4 py-2.5 text-lg font-bold transition-all"
@@ -670,8 +687,8 @@ export default function HostPage() {
                 </div>
                 <p className="text-base" style={{ color: 'var(--muted)' }}>
                   {state.mode === 'classic' && 'Guess who said it — points, streaks & confidence bets.'}
-                  {state.mode === 'realfake' && 'A quote appears with a name on it. Place a confidence bet, then vote REAL or CAP.'}
-                  {state.mode === 'survival' && `Everyone starts with ${SURVIVAL_LIVES} lives. Miss a round = lose one. Last one standing wins.`}
+                  {state.mode === 'realfake' && 'A quote appears with a name on it. Place a confidence bet, then vote True or False.'}
+                  {state.mode === 'survival' && `Everyone starts with ${SURVIVAL_LIVES} lives. Miss a round = lose a life; ${SURVIVAL_LIVES} perfect in a row regenerates one. Last one standing wins.`}
                 </p>
               </div>
             </div>
@@ -682,9 +699,22 @@ export default function HostPage() {
               <button onClick={() => setDrinking(!state.drinking)}
                 className="rounded-lg px-5 py-2.5 text-lg font-bold transition-all"
                 style={{ background: state.drinking ? 'var(--accent)' : 'var(--surface)', color: state.drinking ? '#000' : 'var(--muted)' }}>
-                🍺 {state.drinking ? 'ON' : 'OFF'}
+                {state.drinking ? 'ON' : 'OFF'}
               </button>
               {state.drinking && <span className="text-sm" style={{ color: 'var(--muted)' }}>Wrong = sip · whiff it all = shot · 21+, know your limits</span>}
+            </div>
+
+            {/* Auto-advance rounds */}
+            <div className="flex items-center gap-3">
+              <span className="text-2xl w-28 shrink-0" style={{ color: 'var(--muted)' }}>Auto-next</span>
+              <button onClick={() => setAutoAdvance(!state.autoAdvance)}
+                className="rounded-lg px-5 py-2.5 text-lg font-bold transition-all"
+                style={{ background: state.autoAdvance ? 'var(--primary)' : 'var(--surface)', color: state.autoAdvance ? '#fff' : 'var(--muted)' }}>
+                {state.autoAdvance ? 'ON' : 'OFF'}
+              </button>
+              <span className="text-sm" style={{ color: 'var(--muted)' }}>
+                {state.autoAdvance ? `Rounds advance ${Math.round(REVEAL_DURATION_MS / 1000)}s after each reveal` : 'Host clicks Next each round'}
+              </span>
             </div>
 
             {/* Start */}
@@ -702,10 +732,10 @@ export default function HostPage() {
         const conv = state.question
         const hasContext = !!conv.context
         const contextDone = !hasContext || contextDoneForConv === conv.conversationId
-        // Real or Cap shows ONLY the claimed line (the rest of the convo would give it away).
-        const promptLines = state.mode === 'realfake' && state.rfClaim
-          ? conv.lines.filter((l) => l.lineId === state.rfClaim!.lineId)
-          : conv.lines
+        // True or False shows the WHOLE quote for context; the claimed name attaches to its line.
+        const rfLabel = state.mode === 'realfake' && state.rfClaim
+          ? (lid: number) => (lid === state.rfClaim!.lineId ? state.rfClaim!.claimedSpeakerName : null)
+          : undefined
         return (
           <div className="flex-1 flex flex-col items-center justify-center gap-8 animate-slide-up max-w-6xl mx-auto w-full">
             <ContextBar context={null} happenedAt={conv.happenedAt} />
@@ -714,22 +744,22 @@ export default function HostPage() {
                 key={`ctx-${conv.conversationId}`}
                 plain
                 plainClassName="text-2xl italic w-full text-center"
-                lines={[{ lineId: -1, lineText: `📍 ${conv.context}`, actionText: null }]}
+                lines={[{ lineId: -1, lineText: conv.context!, actionText: null }]}
                 onComplete={() => setContextDoneForConv(conv.conversationId)}
               />
             )}
             {contextDone && (
-              <Typewriter key={conv.conversationId} lines={promptLines} />
+              <Typewriter key={conv.conversationId} lines={conv.lines} speakerLabel={rfLabel} />
             )}
             {contextDone && state.mode === 'realfake' && state.rfClaim && (
-              <div className="rounded-2xl px-8 py-5 text-center animate-slide-up" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
-                <p className="text-3xl font-black" style={{ color: 'var(--accent)' }}>
-                  🕵 {state.rfClaim.claimedSpeakerName} said this… <span className="text-white">REAL or CAP?</span>
-                </p>
+              <div className="rounded-2xl px-10 py-5 text-center animate-slide-up" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
+                <p className="text-4xl font-black" style={{ color: 'var(--accent)' }}>True or False?</p>
               </div>
             )}
             <div className="flex items-center gap-4">
-              <p className="text-3xl font-bold animate-pulse" style={{ color: 'var(--accent)' }}>Get ready to guess…</p>
+              <p className="text-3xl font-bold animate-pulse" style={{ color: 'var(--accent)' }}>
+                {state.mode === 'realfake' ? 'Get ready to vote…' : 'Get ready to guess…'}
+              </p>
               {promptCountdown !== null && promptCountdown > 0 && (
                 <span className="text-5xl font-black tabular-nums" style={{ color: 'var(--accent)' }}>{promptCountdown}</span>
               )}
@@ -744,26 +774,40 @@ export default function HostPage() {
           <TimerBar timeLeft={timeLeft} total={state.timerDuration} />
           <ContextBar context={state.question.context} happenedAt={state.question.happenedAt} small />
           <div className="space-y-5">
-            {(state.mode === 'realfake' && state.rfClaim
-              ? state.question.lines.filter((l) => l.lineId === state.rfClaim!.lineId)
-              : state.question.lines
-            ).map((line) => (
-              <div key={line.lineId} className="rounded-2xl p-7" style={{ background: 'var(--surface)' }}>
-                {line.actionText && <p className="text-lg italic mb-2" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
-                <p className="text-4xl leading-relaxed">&ldquo;{line.lineText}&rdquo;{' '}
-                  <span className="text-3xl font-bold" style={{ color: state.mode === 'realfake' ? 'var(--accent)' : 'var(--primary-light)' }}>
-                    — {state.mode === 'realfake' && state.rfClaim ? state.rfClaim.claimedSpeakerName : '???'}
-                  </span>
-                </p>
-              </div>
-            ))}
+            {state.question.lines.map((line) => {
+              // True or False: spotlight the ONE judged line, dim the rest as context.
+              const isRf = state.mode === 'realfake' && !!state.rfClaim
+              const isClaim = isRf && line.lineId === state.rfClaim!.lineId
+              const isContext = isRf && !isClaim
+              const label = isRf ? (isClaim ? state.rfClaim!.claimedSpeakerName : null) : '???'
+              return (
+                <div key={line.lineId} className="rounded-2xl p-7 transition-all"
+                  style={{
+                    background: 'var(--surface)',
+                    border: isClaim ? '3px solid var(--accent)' : '2px solid transparent',
+                    opacity: isContext ? 0.45 : 1,
+                  }}>
+                  {isContext && <p className="text-sm uppercase tracking-widest mb-2" style={{ color: 'var(--muted)' }}>context</p>}
+                  {line.actionText && <p className="text-lg italic mb-2" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
+                  <p className="text-4xl leading-relaxed">&ldquo;{line.lineText}&rdquo;{' '}
+                    {label !== null && (
+                      <span className="text-3xl font-bold" style={{ color: isRf ? 'var(--accent)' : 'var(--primary-light)' }}>
+                        — {label}{isClaim ? '?' : ''}
+                      </span>
+                    )}
+                  </p>
+                </div>
+              )
+            })}
           </div>
-          {state.mode === 'realfake' && (
-            <p className="text-3xl font-black text-center animate-pulse" style={{ color: 'var(--accent)' }}>REAL or CAP? Vote on your phone!</p>
+          {state.mode === 'realfake' && state.rfClaim && (
+            <p className="text-3xl font-black text-center animate-pulse" style={{ color: 'var(--accent)' }}>
+              Did {state.rfClaim.claimedSpeakerName} really say the highlighted line? Vote on your phone!
+            </p>
           )}
           {state.mode === 'survival' && (
             <p className="text-2xl font-bold text-center" style={{ color: 'var(--incorrect)' }}>
-              💀 {Math.round(state.timerDuration / 1000)}s to answer — miss and you lose a life ⚡
+              {Math.round(state.timerDuration / 1000)}s to answer — miss and you lose a life
             </p>
           )}
           <div className="mt-auto lg:hidden">
@@ -776,7 +820,7 @@ export default function HostPage() {
                 return (
                   <div key={p.id} className="rounded-full px-4 py-1 text-sm font-bold transition-all flex items-center gap-1"
                     style={{ background: done && !off ? 'var(--correct)' : 'var(--surface)', color: done && !off ? '#fff' : 'var(--muted)', opacity: off ? 0.35 : done ? 1 : 0.5 }}>
-                    <span>{p.avatar}</span>{p.name}{off ? ' 📴' : done ? ' ✓' : ''}
+                    <Avatar name={p.name} id={p.id} size={20} />{p.name}{off ? ' (away)' : done ? ' · in' : ''}
                   </div>
                 )
               })}
@@ -794,6 +838,11 @@ export default function HostPage() {
           <div className="space-y-4">
             {state.question.lines.map((line, idx) => {
               const shown = idx < revealStep
+              // True or False: mark the one line that was actually judged.
+              const isRf = state.mode === 'realfake' && !!state.rfClaim
+              const multiRf = isRf && state.question!.lines.length > 1
+              const rfClaimLine = isRf && state.rfClaim!.lineId === line.lineId
+              const rfContextLine = multiRf && !rfClaimLine
               // Who guessed what for this line
               const lineGuesses = state.players.map((p) => ({
                 player: p,
@@ -801,9 +850,14 @@ export default function HostPage() {
               }))
               return (
                 <div key={line.lineId} className="rounded-2xl p-7 transition-all"
-                  style={{ background: 'var(--surface)', border: `2px solid ${shown ? 'var(--correct)' : 'transparent'}` }}>
+                  style={{
+                    background: 'var(--surface)',
+                    border: `3px solid ${rfClaimLine ? 'var(--accent)' : shown ? 'var(--correct)' : 'transparent'}`,
+                    opacity: rfContextLine ? 0.5 : 1,
+                  }}>
+                  {rfClaimLine && multiRf && <p className="text-sm uppercase tracking-widest mb-2 font-bold" style={{ color: 'var(--accent)' }}>the line in question</p>}
                   {/* Context + Quote + Author inline */}
-                  {idx === 0 && state.question?.context && <p className="text-lg italic mb-2" style={{ color: 'var(--muted)' }}>📍 {state.question.context}</p>}
+                  {idx === 0 && state.question?.context && <p className="text-lg italic mb-2" style={{ color: 'var(--muted)' }}>{state.question.context}</p>}
                   {line.actionText && <p className="text-lg italic mb-2" style={{ color: 'var(--muted)' }}>*{line.actionText}*</p>}
                   <p className="text-3xl leading-relaxed font-medium" style={{ color: 'var(--text)' }}>
                     &ldquo;{line.lineText}&rdquo;{' '}
@@ -823,9 +877,9 @@ export default function HostPage() {
                             <p className="text-sm uppercase tracking-widest mb-2 font-bold" style={{ color: 'rgba(74,222,128,0.8)' }}>Correct</p>
                             <div className="flex flex-wrap gap-2">
                               {correctGuesses.map(({ player }) => (
-                                <span key={player.id} className="inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-xl font-bold"
+                                <span key={player.id} className="inline-flex items-center gap-2 rounded-full px-4 py-1.5 text-xl font-bold"
                                   style={{ background: 'var(--correct)', color: '#fff' }}>
-                                  {player.avatar} {player.name}
+                                  <Avatar name={player.name} id={player.id} size={26} />{player.name}
                                 </span>
                               ))}
                             </div>
@@ -838,10 +892,11 @@ export default function HostPage() {
                               {incorrectGuesses.map(({ player, guessId }) => {
                                 const guessName = state.speakers.find((s) => s.id === guessId)?.name ?? '—'
                                 return (
-                                  <span key={player.id} className="inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-xl font-bold border"
+                                  <span key={player.id} className="inline-flex items-center gap-2 rounded-full px-4 py-1.5 text-xl font-bold border"
                                     style={{ background: 'rgba(30,41,59,0.5)', borderColor: 'rgba(51,65,85,1)' }}>
-                                    <span style={{ color: 'rgb(203,213,225)' }}>{player.avatar} {player.name}</span>
-                                    <span style={{ color: 'rgb(100,116,139)' }}> ➔ {guessName}</span>
+                                    <Avatar name={player.name} id={player.id} size={26} />
+                                    <span style={{ color: 'rgb(203,213,225)' }}>{player.name}</span>
+                                    <span style={{ color: 'rgb(100,116,139)' }}>guessed {guessName}</span>
                                   </span>
                                 )
                               })}
@@ -856,7 +911,8 @@ export default function HostPage() {
             })}
           </div>
 
-          {/* Score this round (small screens; large screens use the live sidebar) */}
+          {/* Score this round (small screens; large screens use the live sidebar). Survival has no points. */}
+          {state.mode !== 'survival' && (
           <div className="rounded-2xl p-5 lg:hidden" style={{ background: 'var(--surface)' }}>
             <p className="text-xs uppercase tracking-widest mb-3" style={{ color: 'var(--muted)' }}>This Round</p>
             <div className="space-y-2">
@@ -867,12 +923,13 @@ export default function HostPage() {
                 return (
                   <div key={p.id} className="flex justify-between items-center">
                     <span className="font-bold flex items-center gap-2">
-                      <span>{p.avatar}</span>{p.name}
-                      {bet === 'swap' && <span className="text-xs font-black" style={{ color: 'var(--accent)' }}>🔀 SWAP</span>}
-                      {bet === 3 && <span className="text-xs font-black" style={{ color: 'var(--incorrect)' }}>💀 ALL-IN</span>}
-                      {bet === 2 && <span className="text-xs font-black" style={{ color: 'var(--incorrect)' }}>🔥×2</span>}
-                      {bet === 0.5 && <span className="text-xs font-black" style={{ color: 'var(--muted)' }}>🛡×0.5</span>}
-                      {p.streak > 1 && <span className="text-xs" style={{ color: 'var(--accent)' }}>🔥{p.streak}</span>}
+                      <Avatar name={p.name} id={p.id} size={22} />{p.name}
+                      {bet === 'swap' && <span className="text-xs font-black" style={{ color: 'var(--accent)' }}>SWAP</span>}
+                      {bet === 'shield' && <span className="text-xs font-black" style={{ color: '#60a5fa' }}>🛡 SHIELD</span>}
+                      {bet === 3 && <span className="text-xs font-black" style={{ color: 'var(--incorrect)' }}>ALL-IN</span>}
+                      {bet === 2 && <span className="text-xs font-black" style={{ color: 'var(--incorrect)' }}>×2</span>}
+                      {bet === 0.5 && <span className="text-xs font-black" style={{ color: 'var(--muted)' }}>×0.5</span>}
+                      {p.streak > 1 && <span className="text-xs" style={{ color: 'var(--accent)' }}>streak {p.streak}</span>}
                     </span>
                     <div className="flex gap-3 items-center">
                       {bonus > 0 && <span className="text-xs font-bold" style={{ color: 'var(--accent)' }}>+{bonus} streak</span>}
@@ -884,21 +941,22 @@ export default function HostPage() {
               })}
             </div>
           </div>
+          )}
 
-          {/* Real or Cap verdict */}
+          {/* True or False verdict */}
           {state.mode === 'realfake' && state.rfClaim && (
             <div className="rounded-2xl p-6 space-y-3 animate-slide-up" style={{ background: 'var(--surface)', border: `3px solid ${state.rfClaim.isReal ? 'var(--correct)' : 'var(--incorrect)'}` }}>
               <p className="text-4xl font-black text-center" style={{ color: state.rfClaim.isReal ? 'var(--correct)' : 'var(--incorrect)' }}>
-                {state.rfClaim.isReal ? '✅ REAL — they really said it!' : `🧢 CAP! That was ${state.question.lines.find((l) => l.lineId === state.rfClaim!.lineId)?.speakerName ?? '???'}`}
+                {state.rfClaim.isReal ? 'TRUE — they really said it!' : `FALSE — it was actually ${state.question.lines.find((l) => l.lineId === state.rfClaim!.lineId)?.speakerName ?? '???'}`}
               </p>
               <div className="flex flex-wrap gap-2 justify-center">
                 {state.players.map((p) => {
                   const vote = state.rfVotes[p.id]
                   const right = state.perfectRound[p.id] === true
                   return (
-                    <span key={p.id} className="inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-xl font-bold"
+                    <span key={p.id} className="inline-flex items-center gap-2 rounded-full px-4 py-1.5 text-xl font-bold"
                       style={{ background: right ? 'var(--correct)' : 'rgba(30,41,59,0.5)', color: right ? '#fff' : 'rgb(148,163,184)', border: right ? 'none' : '1px solid rgba(51,65,85,1)' }}>
-                      {p.avatar} {p.name} — {vote === undefined ? '😴 no vote' : vote === 'real' ? 'REAL' : 'CAP'}
+                      <Avatar name={p.name} id={p.id} size={26} />{p.name} — {vote === undefined ? 'no vote' : vote === 'real' ? 'True' : 'False'}
                     </span>
                   )
                 })}
@@ -906,19 +964,21 @@ export default function HostPage() {
             </div>
           )}
 
-          {/* Survival lives */}
+          {/* Survival lives (no points — lives are the only currency) */}
           {state.mode === 'survival' && (
             <div className="rounded-2xl p-6 animate-slide-up" style={{ background: 'var(--surface)', border: '2px solid var(--incorrect)' }}>
-              <p className="text-lg uppercase tracking-widest mb-3 font-black" style={{ color: 'var(--incorrect)' }}>💀 Lives</p>
+              <p className="text-lg uppercase tracking-widest mb-3 font-black" style={{ color: 'var(--incorrect)' }}>Lives</p>
               <div className="flex flex-wrap gap-3">
                 {state.players.map((p) => {
                   const n = state.lives[p.id] ?? 0
-                  const lostThisRound = state.perfectRound[p.id] === false && n > 0
+                  const d = state.lifeDeltas[p.id] ?? 0
                   return (
                     <span key={p.id} className="inline-flex items-center gap-2 rounded-full px-4 py-1.5 text-2xl font-bold"
                       style={{ background: n > 0 ? 'rgba(255,255,255,0.06)' : 'rgba(239,68,68,0.18)', opacity: n > 0 ? 1 : 0.7 }}>
-                      {p.avatar} {p.name} {n > 0 ? '❤️'.repeat(n) : '💀 OUT'}
-                      {lostThisRound && <span className="text-base" style={{ color: 'var(--incorrect)' }}>−1</span>}
+                      <Avatar name={p.name} id={p.id} size={28} /> {p.name}{' '}
+                      {n > 0 ? <Hearts n={n} /> : <span style={{ color: 'var(--incorrect)' }}>OUT</span>}
+                      {d < 0 && <span className="text-base" style={{ color: 'var(--incorrect)' }}>{d}</span>}
+                      {d > 0 && <span className="text-base" style={{ color: 'var(--correct)' }}>+{d} life!</span>}
                     </span>
                   )
                 })}
@@ -929,14 +989,33 @@ export default function HostPage() {
           {/* Point swap callouts */}
           {state.executedSwaps.length > 0 && (
             <div className="rounded-2xl p-5 space-y-2" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
-              <p className="text-lg uppercase tracking-widest font-black" style={{ color: 'var(--accent)' }}>🔀 Point Swap!</p>
+              <p className="text-lg uppercase tracking-widest font-black" style={{ color: 'var(--accent)' }}>Point Swap!</p>
               {state.executedSwaps.map(({ winnerId, loserId }) => {
                 const winner = state.players.find((p) => p.id === winnerId)
                 const loser = state.players.find((p) => p.id === loserId)
                 if (!winner || !loser) return null
                 return (
-                  <p key={winnerId} className="text-2xl font-bold">
-                    {winner.avatar} {winner.name} swapped points with {loser.avatar} {loser.name}!
+                  <p key={winnerId} className="text-2xl font-bold flex items-center gap-2 flex-wrap">
+                    <Avatar name={winner.name} id={winner.id} size={26} />{winner.name} swapped points with
+                    <Avatar name={loser.name} id={loser.id} size={26} />{loser.name}!
+                  </p>
+                )
+              })}
+            </div>
+          )}
+
+          {/* Shield block callouts */}
+          {(state.blockedSwaps?.length ?? 0) > 0 && (
+            <div className="rounded-2xl p-5 space-y-2" style={{ background: 'var(--surface)', border: '2px solid #3b82f6' }}>
+              <p className="text-lg uppercase tracking-widest font-black" style={{ color: '#60a5fa' }}>🛡 Shield Block!</p>
+              {state.blockedSwaps.map(({ attackerId, defenderId }) => {
+                const attacker = state.players.find((p) => p.id === attackerId)
+                const defender = state.players.find((p) => p.id === defenderId)
+                if (!attacker || !defender) return null
+                return (
+                  <p key={attackerId} className="text-2xl font-bold flex items-center gap-2 flex-wrap">
+                    <Avatar name={defender.name} id={defender.id} size={26} />{defender.name} blocked
+                    <Avatar name={attacker.name} id={attacker.id} size={26} />{attacker.name}&rsquo;s swap — they lose 750!
                   </p>
                 )
               })}
@@ -946,7 +1025,7 @@ export default function HostPage() {
           {/* Drinks this round (Tipsy Edition overlay) */}
           {state.drinking && (
             <div className="rounded-2xl p-6" style={{ background: 'var(--surface)', border: '2px solid var(--accent)' }}>
-              <p className="text-lg uppercase tracking-widest mb-3 font-black" style={{ color: 'var(--accent)' }}>🍺 Drink Up</p>
+              <p className="text-lg uppercase tracking-widest mb-3 font-black" style={{ color: 'var(--accent)' }}>Drink Up</p>
               <div className="space-y-2">
                 {state.players.map((p) => {
                   const result = state.mode === 'realfake'
@@ -954,7 +1033,7 @@ export default function HostPage() {
                     : computeRoundDrinks(state.question!, (lid) => state.guesses[lid]?.[p.id])
                   return (
                     <div key={p.id} className="flex justify-between items-center text-2xl">
-                      <span className="font-bold flex items-center gap-2"><span>{p.avatar}</span>{p.name}</span>
+                      <span className="font-bold flex items-center gap-2"><Avatar name={p.name} id={p.id} size={26} />{p.name}</span>
                       <span className="font-bold" style={{ color: result.kind === 'safe' ? 'var(--correct)' : 'var(--accent)' }}>
                         {drinkResultText(result)}
                       </span>
@@ -968,24 +1047,33 @@ export default function HostPage() {
             </div>
           )}
 
-          <button onClick={continueAfterReveal}
-            className="rounded-2xl py-6 text-3xl font-black transition-all hover:scale-105"
-            style={{ background: 'var(--primary)', color: '#fff' }}>
-            {state.currentRound >= state.totalRounds || (state.mode === 'survival' && aliveIds(state.lives).length <= 1) ? 'See Final Results' : 'Next Round →'}
-          </button>
+          <div className="flex flex-col items-center gap-2">
+            {state.autoAdvance && revealCountdown !== null && (
+              <p className="text-xl font-bold" style={{ color: 'var(--muted)' }}>
+                {state.currentRound >= state.totalRounds || (state.mode === 'survival' && aliveIds(state.lives).length <= 1)
+                  ? `Final results in ${revealCountdown}s`
+                  : `Next round in ${revealCountdown}s`}
+              </p>
+            )}
+            <button onClick={continueAfterReveal}
+              className="rounded-2xl py-6 px-12 text-3xl font-black transition-all hover:scale-105"
+              style={{ background: 'var(--primary)', color: '#fff' }}>
+              {state.currentRound >= state.totalRounds || (state.mode === 'survival' && aliveIds(state.lives).length <= 1) ? 'See Final Results' : 'Next Round'}
+            </button>
+          </div>
         </div>
       )}
 
       {/* Leaderboard */}
       {state.phase === 'leaderboard' && (
         <div className="flex-1 flex flex-col items-center justify-center gap-8">
-          <h2 className="text-6xl font-black text-center animate-bounce-in" style={{ color: 'var(--accent)' }}>🏆 Final Results</h2>
+          <h2 className="text-6xl font-black text-center animate-bounce-in" style={{ color: 'var(--accent)' }}>Final Results</h2>
           <Podium players={state.players} drinking={state.drinking} lives={state.mode === 'survival' ? state.lives : undefined} />
           <div className="flex flex-col items-center gap-4">
             <button onClick={playAgain}
               className="rounded-2xl px-12 py-5 text-2xl font-black transition-all hover:scale-105"
               style={{ background: 'var(--primary)', color: '#fff' }}>
-              🔄 New Game (same players)
+              New Game (same players)
             </button>
             <button onClick={() => { localStorage.removeItem(STORAGE_KEY); window.location.reload() }}
               className="text-lg underline" style={{ color: 'var(--muted)' }}>
